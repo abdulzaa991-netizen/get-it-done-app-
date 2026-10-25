@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "get-it-done",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // The mobile web app (static files). Anything under /api/* falls through to the Worker.
+  "assets": { "directory": "./public" },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "get-it-done",
+      // Replace with the id printed by `npx wrangler d1 create get-it-done`.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Hourly: auto-release held payments the poster hasn't confirmed or disputed in time.
+  "triggers": { "crons": ["17 * * * *"] },
+
+  "vars": {
+    "APP_URL": "http://localhost:8787",
+    // Platform cut taken from the worker's payout, in basis points (1000 = 10%).
+    "PLATFORM_FEE_BPS": "1000",
+    // Days after the worker marks a job done before the payment releases automatically.
+    "AUTO_RELEASE_DAYS": "5",
+    // Comma-separated emails that can see and resolve disputes.
+    "ADMIN_EMAILS": ""
+  }
+  // Secrets (never in this file): STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET.
+  // Set with `npx wrangler secret put <NAME>`; locally use .dev.vars (see .dev.vars.example).
+}

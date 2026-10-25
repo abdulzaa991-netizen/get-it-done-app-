@@ -1,0 +1,119 @@
+// End-to-end run of the whole job lifecycle against a local `wrangler dev` (simulated payments).
+// Usage: npm run db:migrate:local && npx wrangler dev --var ADMIN_EMAILS:admin@test.local  (then)  npm run e2e
+const BASE = process.env.BASE_URL || 'http://localhost:8787';
+const run = Date.now();
+let failures = 0;
+
+function client() {
+  let cookie = '';
+  return async (path, body, method) => {
+    const res = await fetch(BASE + '/api' + path, {
+      method: method || (body ? 'POST' : 'GET'),
+      headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const set = res.headers.get('set-cookie');
+    if (set) cookie = set.split(';')[0];
+    return { status: res.status, data: await res.json().catch(() => ({})) };
+  };
+}
+
+function check(name, cond, detail) {
+  console.log(`${cond ? 'ok  ' : 'FAIL'} ${name}${cond ? '' : ' ' + JSON.stringify(detail)}`);
+  if (!cond) failures++;
+}
+
+const poster = client(), worker = client(), other = client(), admin = client(), anon = client();
+const signup = (c, who) => c('/auth/signup', { email: `${who}-${run}@test.local`, password: 'longenough123', name: who, suburb: 'Parramatta', postcode: '2150', acceptTerms: true });
+
+check('poster signs up', (await signup(poster, 'Pat')).status === 201);
+check('worker signs up', (await signup(worker, 'Wes')).status === 201);
+check('other signs up', (await signup(other, 'Ola')).status === 201);
+await admin('/auth/signup', { email: 'admin@test.local', password: 'longenough123', name: 'Admin', acceptTerms: true });
+check('admin logs in', (await admin('/auth/login', { email: 'admin@test.local', password: 'longenough123' })).status === 200);
+check('signup needs terms', (await anon('/auth/signup', { email: `x${run}@t.local`, password: 'longenough123', name: 'X' })).status === 400);
+check('wrong password rejected', (await anon('/auth/login', { email: `pat-${run}@test.local`, password: 'nope' })).status === 401);
+check('form-encoded POST rejected (CSRF)', (await fetch(BASE + '/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'a=1' })).status === 400);
+check('cross-origin POST rejected', (await fetch(BASE + '/api/auth/logout', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' }, body: '{}' })).status === 403);
+
+const meta = (await anon('/meta')).data;
+check('simulated payments on locally', meta.simulatedPayments === true);
+
+const job = await poster('/jobs', { kind: 'home', category: 'Gardening', title: 'Mow front and back lawn', description: 'About 200m2, edges too, green bin available.', suburb: 'Parramatta', postcode: '2150', address: '1 Secret St', pricing: 'quote', budget: '120' });
+check('poster posts job', job.status === 201, job.data);
+const id = job.data.id;
+
+const pub = await anon(`/jobs/${id}`);
+check('public sees open job without address', pub.status === 200 && pub.data.job.address === null, pub.data.job);
+check('public profile hides email', !JSON.stringify(pub.data.poster).includes('@'));
+check('job appears in nearby browse', (await anon('/jobs?postcode=2151')).data.jobs.some((j) => j.id === id));
+check('anon cannot quote', (await anon(`/jobs/${id}/quotes`, { amount: '100' })).status === 401);
+check('poster cannot quote own job', (await poster(`/jobs/${id}/quotes`, { amount: '100' })).status === 400);
+
+check('worker sets up payouts (simulated)', (await worker('/payouts/onboard', {})).data.simulated === true);
+check('worker quotes', (await worker(`/jobs/${id}/quotes`, { amount: '110', message: 'Can do Saturday, text 0412 345 678' })).status === 201);
+check('other quotes', (await other(`/jobs/${id}/quotes`, { amount: '95' })).status === 201);
+check('worker cannot see other quotes', (await worker(`/jobs/${id}`)).data.quotes.length === 1);
+
+const pjob = (await poster(`/jobs/${id}`)).data;
+check('poster sees both quotes', pjob.quotes.length === 2);
+check('phone masked in quote', pjob.quotes.find((q) => q.amountCents === 11000)?.message.includes('[phone hidden]'), pjob.quotes);
+const wesId = pjob.quotes.find((q) => q.amountCents === 11000).worker.id;
+
+check('worker messages poster', (await worker(`/jobs/${id}/messages`, { body: 'Is the side gate unlocked? me@mail.com' })).status === 201);
+check('poster replies', (await poster(`/jobs/${id}/messages`, { body: 'Yes it is', worker: wesId })).status === 201);
+const msgs = (await poster(`/jobs/${id}/messages?worker=${wesId}`)).data.messages;
+check('chat thread has 2 messages, email masked', msgs.length === 2 && msgs[0].body.includes('[email hidden]'), msgs);
+check('other cannot read worker thread', (await other(`/jobs/${id}/messages?worker=${wesId}`)).data.messages.length === 0);
+check('poster cannot open thread with stranger', (await poster(`/jobs/${id}/messages`, { body: 'hi', worker: 'nobody' })).status === 404);
+
+const quoteId = pjob.quotes.find((q) => q.amountCents === 11000).id;
+check('worker cannot accept', (await worker(`/jobs/${id}/accept`, { quoteId })).status === 403);
+check('poster accepts quote', (await poster(`/jobs/${id}/accept`, { quoteId })).status === 200);
+check('double accept blocked', (await poster(`/jobs/${id}/accept`, { quoteId })).status >= 400);
+check('job hidden from public once taken', (await anon(`/jobs/${id}`)).status === 404);
+check('worker cannot mark done before payment', (await worker(`/jobs/${id}/done`, {})).status === 409);
+check('worker does not see address before payment', (await worker(`/jobs/${id}`)).data.job.address === null);
+
+check('poster pays (simulated hold)', (await poster(`/jobs/${id}/pay`, {})).data.simulated === true);
+let w = (await worker(`/jobs/${id}`)).data;
+check('job funded, worker now sees address', w.job.status === 'funded' && w.job.address === '1 Secret St', w.job);
+check('worker sees fee and payout', w.job.feeCents === 1100);
+check('poster cannot release before done', (await poster(`/jobs/${id}/confirm`, {})).status === 409);
+check('poster cannot cancel once funded', (await poster(`/jobs/${id}/cancel`, {})).status === 409);
+check('worker marks done', (await worker(`/jobs/${id}/done`, {})).status === 200);
+check('review blocked before release', (await poster(`/jobs/${id}/reviews`, { rating: 5 })).status === 409);
+check('poster confirms & releases', (await poster(`/jobs/${id}/confirm`, {})).status === 200);
+check('double release blocked', (await poster(`/jobs/${id}/confirm`, {})).status === 409);
+check('poster reviews worker', (await poster(`/jobs/${id}/reviews`, { rating: 5, body: 'Great job' })).status === 201);
+check('worker reviews poster', (await worker(`/jobs/${id}/reviews`, { rating: 4 })).status === 201);
+check('duplicate review blocked', (await poster(`/jobs/${id}/reviews`, { rating: 1 })).status === 409);
+check('outsider cannot review', (await other(`/jobs/${id}/reviews`, { rating: 1 })).status === 403);
+const prof = (await anon(`/users/${wesId}`)).data;
+check('worker rating shows', prof.user.rating.avg === 5 && prof.reviews.length === 1, prof.user);
+
+// Dispute path: trade job, fixed price.
+const job2 = (await poster('/jobs', { kind: 'trade', category: 'Painting', title: 'Overflow: repaint 3 bed unit', description: 'Interior walls and ceilings, we supply paint. Need done this week.', suburb: 'Parramatta', postcode: '2150', pricing: 'fixed', budget: '2400' })).data.id;
+check('fixed-price quote ignores amount', (await worker(`/jobs/${job2}/quotes`, { amount: '1' })).status === 201);
+const q2 = (await poster(`/jobs/${job2}`)).data.quotes[0];
+check('fixed quote at fixed price', q2.amountCents === 240000);
+await poster(`/jobs/${job2}/accept`, { quoteId: q2.id });
+await poster(`/jobs/${job2}/pay`, {});
+check('worker raises problem', (await worker(`/jobs/${job2}/dispute`, { reason: 'Poster has not given access to the unit.' })).status === 200);
+check('non-admin cannot list disputes', (await poster('/admin/disputes')).status === 403);
+const disputes = (await admin('/admin/disputes')).data.disputes;
+const d = disputes.find((x) => x.jobId === job2);
+check('admin sees dispute', !!d, disputes);
+check('admin refunds', (await admin(`/admin/disputes/${d.id}/resolve`, { outcome: 'refund', note: 'Agreed by both' })).status === 200);
+check('job refunded', (await poster(`/jobs/${job2}`)).data.job.status === 'refunded');
+
+// Cancel path
+const job3 = (await poster('/jobs', { kind: 'home', category: 'Cleaning', title: 'End of lease clean', description: 'Two bedroom apartment, carpets included please.', suburb: 'Parramatta', postcode: '2150', pricing: 'quote' })).data.id;
+check('poster cancels open job', (await poster(`/jobs/${job3}/cancel`, {})).status === 200);
+check('cannot quote cancelled job', (await worker(`/jobs/${job3}/quotes`, { amount: '300' })).status >= 400);
+
+const mine = (await worker('/jobs/mine')).data;
+check('worker "working" list has both jobs', mine.working.length === 2);
+
+console.log(failures ? `\n${failures} FAILED` : '\nAll checks passed');
+process.exit(failures ? 1 : 0);

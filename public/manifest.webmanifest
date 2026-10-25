@@ -1,0 +1,10 @@
+{
+  "name": "Get It Done",
+  "short_name": "Get It Done",
+  "description": "Post a job, get quotes from local workers and trades, pay safely when it's done.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f7f9",
+  "theme_color": "#0f766e",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

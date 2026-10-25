@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f766e">
+  <meta name="description" content="Post a job, get quotes from local workers and trades, pay safely when it's done.">
+  <title>Get It Done</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="top">
+    <a href="#/" class="brand"><img src="/icon.svg" alt="" width="28" height="28"> Get It Done</a>
+    <span id="sim-badge" class="badge warn" hidden>Test mode · no real payments</span>
+  </header>
+  <main id="view" aria-live="polite"></main>
+  <nav class="tabs" aria-label="Main">
+    <a href="#/" data-tab="browse"><span aria-hidden="true">🔎</span>Browse</a>
+    <a href="#/post" data-tab="post"><span aria-hidden="true">➕</span>Post a job</a>
+    <a href="#/mine" data-tab="mine"><span aria-hidden="true">📋</span>My jobs</a>
+    <a href="#/profile" data-tab="profile"><span aria-hidden="true">👤</span>Profile</a>
+  </nav>
+  <div id="toast" role="status" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
