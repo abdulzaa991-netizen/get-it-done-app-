@@ -13,10 +13,10 @@
   --ok: #157f3b;
   --radius: 14px;
   --tabs-h: 64px;
-  color-scheme: light dark;
+  color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #0e1418;
     --card: #172026;
     --text: #e8eef2;
@@ -29,7 +29,23 @@
     --warn-soft: #33270f;
     --danger: #ff7b6e;
     --ok: #5fd08a;
+    color-scheme: dark;
   }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1418;
+  --card: #172026;
+  --text: #e8eef2;
+  --muted: #93a3af;
+  --line: #26323a;
+  --brand: #2bb3a5;
+  --brand-ink: #062320;
+  --brand-soft: #123331;
+  --warn: #f0b44c;
+  --warn-soft: #33270f;
+  --danger: #ff7b6e;
+  --ok: #5fd08a;
+  color-scheme: dark;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; }
@@ -121,3 +137,16 @@ button:disabled { opacity: .55; cursor: default; }
 .hero h1 { margin: 0 0 4px; }
 .hero p { opacity: .92; }
 .hero .btn { background: var(--brand-ink); color: var(--brand); border-color: var(--brand-ink); margin-top: 10px; }
+button.danger-solid { background: var(--danger); border-color: var(--danger); color: var(--card); }
+.sheet {
+  position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-end; justify-content: center;
+  background: color-mix(in srgb, var(--text) 45%, transparent);
+}
+.sheet-panel {
+  width: 100%; max-width: 560px; background: var(--card); border-radius: 18px 18px 0 0;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
+  animation: sheet-up .18s ease-out;
+}
+.sheet-panel h2 { margin-top: 0; }
+@keyframes sheet-up { from { transform: translateY(24px); } }
+@media (prefers-reduced-motion: reduce) { .sheet-panel { animation: none; } }

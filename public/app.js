@@ -2,7 +2,9 @@
 // All user content goes in via textContent (the h() helper), never innerHTML.
 
 const view = document.getElementById('view');
-const state = { me: null, meta: null, poll: null };
+const state = { me: null, meta: null, poll: null, page: 0 };
+/** True once the user has moved to another page, so a slow-loading page must not draw or redirect. */
+const movedOn = (page) => page !== state.page;
 
 // ---------- tiny helpers ----------
 
@@ -70,6 +72,44 @@ function action(fn) {
   };
 }
 
+/** sessionStorage that never throws (private browsing and sandboxed frames can block it). */
+const session = {
+  get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
+  /** Forget per-person view settings (filters, last tab) when the account changes. */
+  clear() { try { sessionStorage.clear(); } catch {} },
+};
+
+/**
+ * In-page confirmation sheet (instead of the browser's confirm/prompt, which look out of place on
+ * phones and are blocked in some app views). Resolves true/false, or the typed text when
+ * `input` is set (null if cancelled).
+ */
+function ask({ title, message, confirmLabel = 'Confirm', danger = false, input = null }) {
+  return new Promise((resolve) => {
+    const field = input ? h('textarea', { id: 'ask-input', 'aria-label': title, placeholder: input.placeholder || '', minlength: input.minLength || 0 }) : null;
+    const done = (v) => { sheet.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
+    const onKey = (e) => e.key === 'Escape' && done(input ? null : false);
+    const form = h('form', { class: 'sheet-panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'ask-title', onsubmit: (e) => {
+      e.preventDefault();
+      if (!input) return done(true);
+      const v = field.value.trim();
+      if (v.length < (input.minLength || 1)) return toast(input.tooShort || 'Please add a few more details');
+      done(v);
+    } },
+      h('h2', { id: 'ask-title' }, title),
+      message ? h('p', { class: 'muted' }, message) : null,
+      field,
+      h('div', { class: 'actions' },
+        h('button', { class: danger ? 'danger-solid' : '' }, confirmLabel),
+        h('button', { type: 'button', class: 'secondary', onclick: () => done(input ? null : false) }, 'Go back')));
+    const sheet = h('div', { class: 'sheet', onclick: (e) => e.target === sheet && done(input ? null : false) }, form);
+    document.addEventListener('keydown', onKey);
+    document.body.append(sheet);
+    (field || form.querySelector('button')).focus();
+  });
+}
+
 const formData = (form) => Object.fromEntries(new FormData(form));
 const go = (hash) => (location.hash === hash ? render() : (location.hash = hash));
 
@@ -110,13 +150,15 @@ function jobCard(j, extra) {
 }
 
 async function browseView() {
-  const saved = JSON.parse(sessionStorage.getItem('filters') || '{}');
+  const page = state.page;
+  const saved = JSON.parse(session.get('filters') || '{}');
   const f = { kind: saved.kind || '', category: saved.category || '', postcode: saved.postcode || state.me?.postcode || '', q: saved.q || '' };
   const list = h('div', {});
   const load = async () => {
-    sessionStorage.setItem('filters', JSON.stringify(f));
+    session.set('filters', JSON.stringify(f));
     const qs = new URLSearchParams(Object.entries(f).filter(([, v]) => v));
     const { jobs } = await api(`/jobs?${qs}`);
+    if (movedOn(page)) return;
     list.replaceChildren(...(jobs.length ? jobs.map((j) => jobCard(j)) : [h('p', { class: 'empty' }, 'No open jobs match. Try clearing the filters, or post one yourself.')]));
   };
   const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Job type' },
@@ -189,7 +231,10 @@ async function postView() {
 }
 
 async function jobView(id) {
+  const page = state.page;
+  clearInterval(state.poll); // a reload of this page replaces its chat poller
   const data = await api(`/jobs/${id}`);
+  if (movedOn(page)) return;
   const { job, poster, role, quotes, threads } = data;
   const me = state.me;
   const reload = () => jobView(id);
@@ -232,7 +277,12 @@ async function jobView(id) {
         h('button', { onclick: post('confirm', {}, 'Payment released, thanks!') }, 'Confirm & release payment'));
     }
     if (['open', 'awaiting_payment'].includes(job.status)) {
-      act.append(h('button', { class: 'danger', onclick: (e) => confirm('Cancel this job?') && post('cancel', {}, 'Job cancelled')(e) }, 'Cancel job'));
+      act.append(h('button', { class: 'danger', onclick: action(async () => {
+        if (!(await ask({ title: 'Cancel this job?', message: 'Workers who quoted will see it’s cancelled. Nothing has been paid, so there’s nothing to refund.', confirmLabel: 'Cancel job', danger: true }))) return;
+        await api(`/jobs/${id}/cancel`, { body: {} });
+        toast('Job cancelled');
+        reload();
+      }) }, 'Cancel job'));
     }
   }
   if (role === 'worker') {
@@ -246,7 +296,12 @@ async function jobView(id) {
   }
   if ((role === 'poster' || role === 'worker') && ['funded', 'done'].includes(job.status)) {
     act.append(h('button', { class: 'secondary', onclick: action(async () => {
-      const reason = prompt('What’s wrong? Our team will review it and the payment stays held meanwhile.');
+      const reason = await ask({
+        title: 'Report a problem',
+        message: 'Tell us what’s wrong. The payment stays held while our team looks into it.',
+        confirmLabel: 'Send report',
+        input: { placeholder: 'What happened, and what would put it right?', minLength: 10, tooShort: 'Please describe the problem in a sentence or two' },
+      });
       if (!reason) return;
       await api(`/jobs/${id}/dispute`, { body: { reason } });
       toast('Problem reported. We’ll be in touch.');
@@ -278,7 +333,12 @@ async function jobView(id) {
         q.message ? h('p', {}, q.message) : null,
         h('div', { class: 'row wrap' }, h('span', {}, q.status !== 'pending' ? h('span', { class: 'badge grey' }, q.status) : ''),
           job.status === 'open' && q.status === 'pending'
-            ? h('button', { onclick: (e) => confirm(`Accept ${w.name}'s quote of ${money(q.amountCents)}?`) && post('accept', { quoteId: q.id }, 'Quote accepted, now pay to book')(e) }, 'Accept')
+            ? h('button', { onclick: action(async () => {
+              if (!(await ask({ title: `Accept ${w.businessName || w.name}’s quote?`, message: `${money(q.amountCents)}. Other quotes will be declined. Next you pay, and we hold the money until the job’s done.`, confirmLabel: 'Accept quote' }))) return;
+              await api(`/jobs/${id}/accept`, { body: { quoteId: q.id } });
+              toast('Quote accepted. Now pay to book.');
+              reload();
+            }) }, 'Accept')
             : null),
       ));
     }
@@ -332,24 +392,28 @@ async function jobView(id) {
         !['funded', 'done', 'released', 'disputed'].includes(job.status) ? h('p', { class: 'muted' }, 'Phone numbers and emails are hidden until the job is booked. Keep payment in the app so you’re covered.') : null]));
       sections.push(chatWrap);
       await pull();
+      if (movedOn(page)) return;
       state.poll = setInterval(() => pull().catch(() => {}), 5000);
     } else if (role === 'poster') {
       sections.push(chatWrap, h('p', { class: 'muted' }, 'Workers who message or quote will show up here.'));
     }
   }
 
+  if (movedOn(page)) return;
   show(...sections);
   if (paidReturn && job.status === 'awaiting_payment') setTimeout(() => location.hash.startsWith(`#/jobs/${id}`) && reload(), 3000);
 }
 
 async function mineView() {
   if (!state.me) return go('#/login');
+  const page = state.page;
   const { posted, working, quoted } = await api('/jobs/mine');
-  const tab = sessionStorage.getItem('mineTab') || 'posted';
+  if (movedOn(page)) return;
+  const tab = session.get('mineTab') || 'posted';
   const lists = { posted, working, quoted };
   const body = h('div', {});
   const showTab = (t) => {
-    sessionStorage.setItem('mineTab', t);
+    session.set('mineTab', t);
     seg.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.t === t)));
     const items = lists[t];
     body.replaceChildren(...(items.length
@@ -364,8 +428,10 @@ async function mineView() {
 
 async function profileView() {
   if (!state.me) return go('#/login');
+  const page = state.page;
   if (location.hash.includes('payouts=')) await api('/payouts/refresh', { body: {} }).catch(() => {});
   const { user: u } = await api('/me');
+  if (movedOn(page)) return;
   state.me = u;
   const form = h('form', { onsubmit: action(async () => {
     const v = formData(form);
@@ -418,13 +484,15 @@ async function profileView() {
       u.rating?.count ? ` · ${stars(u.rating.avg)} (${u.rating.count})` : ''),
     payouts, form, pw,
     u.isAdmin ? h('a', { class: 'btn secondary block', href: '#/admin' }, 'Admin: disputes') : null,
-    h('button', { class: 'secondary block', onclick: action(async () => { await api('/auth/logout', { body: {} }); state.me = null; go('#/'); }) }, 'Log out'),
+    h('button', { class: 'secondary block', onclick: action(async () => { await api('/auth/logout', { body: {} }); state.me = null; session.clear(); go('#/'); }) }, 'Log out'),
     h('p', { class: 'muted', style: 'margin-top:16px' }, h('a', { href: '/terms.html' }, 'Terms'), ' · ', h('a', { href: '/privacy.html' }, 'Privacy')),
   );
 }
 
 async function userView(id) {
+  const page = state.page;
   const { user: u, reviews } = await api(`/users/${id}`);
+  if (movedOn(page)) return;
   show(
     h('h1', {}, u.businessName || u.name),
     h('p', { class: 'muted' }, [u.businessName ? u.name : null, u.suburb, `Member since ${new Date(u.memberSince).getFullYear()}`].filter(Boolean).join(' · ')),
@@ -449,7 +517,7 @@ function authView(mode) {
     await api(`/auth/${mode}`, { body: { ...v, acceptTerms: v.acceptTerms === 'on' } });
     await loadMe();
     toast(signup ? 'Welcome to Get It Done!' : 'Welcome back');
-    go(sessionStorage.getItem('after') || '#/');
+    go(session.get('after') || '#/');
   }) },
     signup ? field('Your name', h('input', { id: 'sname', name: 'name', required: true, autocomplete: 'name' })) : null,
     field('Email', h('input', { id: 'email', name: 'email', type: 'email', required: true, autocomplete: 'email' })),
@@ -507,12 +575,15 @@ function resetView() {
 }
 
 async function adminView() {
+  const page = state.page;
   const { disputes } = await api('/admin/disputes');
+  if (movedOn(page)) return;
   show(h('h1', {}, 'Open disputes'),
     disputes.length ? disputes.map((d) => {
       const note = h('input', { placeholder: 'Resolution note (kept on record)', 'aria-label': 'Resolution note' });
       const resolve = (outcome) => action(async () => {
-        if (!confirm(outcome === 'refund' ? 'Refund the poster in full?' : 'Release the payment to the worker?')) return;
+        const refund = outcome === 'refund';
+        if (!(await ask({ title: refund ? 'Refund the poster in full?' : 'Release the payment to the worker?', message: `${money(d.amountCents)} for “${d.title}”. This can’t be undone.`, confirmLabel: refund ? 'Refund poster' : 'Release payment', danger: refund }))) return;
         await api(`/admin/disputes/${d.id}/resolve`, { body: { outcome, note: note.value } });
         toast('Resolved');
         adminView();
@@ -531,6 +602,7 @@ async function loadMe() {
 }
 
 async function render() {
+  const page = ++state.page;
   clearInterval(state.poll);
   // A message about the previous page shouldn't linger on the next one.
   // (Toasts raised just before navigating, like "Job posted", are kept.)
@@ -539,7 +611,7 @@ async function render() {
   const parts = (path || '/').split('/').filter(Boolean);
   const tab = { '': 'browse', post: 'post', mine: 'mine', profile: 'profile' }[parts[0] ?? ''];
   document.querySelectorAll('.tabs a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab));
-  if (!['login', 'signup', 'forgot', 'reset'].includes(parts[0])) sessionStorage.setItem('after', location.hash || '#/');
+  if (!['login', 'signup', 'forgot', 'reset'].includes(parts[0])) session.set('after', location.hash || '#/');
   try {
     if (!parts.length) await browseView();
     else if (parts[0] === 'post') await postView();
@@ -553,15 +625,23 @@ async function render() {
     else if (parts[0] === 'admin') await adminView();
     else show(h('p', { class: 'empty' }, 'Page not found.'));
   } catch (err) {
+    if (movedOn(page)) return;
     if (err.status === 401) return go('#/login');
     show(h('p', { class: 'empty' }, err.message));
   }
-  window.scrollTo(0, 0);
+  if (!movedOn(page)) window.scrollTo(0, 0);
 }
 
 (async () => {
   [state.meta] = await Promise.all([api('/meta'), loadMe()]);
   document.getElementById('sim-badge').hidden = !state.meta.simulatedPayments;
   addEventListener('hashchange', render);
+  // Lets an embedding page (the clickable preview) ask for a fresh load after it changes who's logged in.
+  addEventListener('gid:refresh', async () => {
+    state.page++; // whatever was loading belonged to the previous account
+    session.clear();
+    await loadMe();
+    render();
+  });
   render();
 })();
