@@ -66,13 +66,14 @@ Estimates as at October 2026. **Check each on the provider's pricing page before
 | Email (Resend etc.) | Free tier around 3,000 emails/month | When notifications ship |
 | Lawyer: terms, privacy, contractor model review | Rough guess A$2,000–8,000 one-off | Before launch |
 | Platform insurance (public liability, professional indemnity, cyber) | Rough guess A$1,500–5,000/year; get broker quotes | Before launch |
-| Company registration (if it's its own Pty Ltd) | ASIC fee about A$600 | Before launch, if chosen |
+| Company registration (Pty Ltd, decided) | ASIC fee about A$600, plus accountant setup if used | Before launch |
+| Trade mark (optional, recommended) | About A$250–400 per class with IP Australia | Before launch, after a name check |
 
 **Fee maths at the default 10%:** on a A$200 job the poster pays A$200 and the worker receives A$180. From the A$20 fee, Stripe takes about A$3.70 (card) plus payout and active-account costs, which leaves roughly A$15–16 before GST on the fee. The fee is set by `PLATFORM_FEE_BPS` in `wrangler.jsonc`.
 
 ## Going live checklist
 
-1. **Brand/ownership decision** (under Salam Solutions or its own business). Nothing public until then.
+1. ~~Brand/ownership decision~~ **Decided: its own business, separate Pty Ltd.** Name check, company registration and accounts in the company's name are still to do (see [LEGAL.md §7](LEGAL.md#7-business-structure))
 2. Legal items in [LEGAL.md](LEGAL.md) done and terms/privacy pages replaced
 3. Password reset + email notifications shipped
 4. Security review (run `/security-review`, plus manual review of payments and authorisation)

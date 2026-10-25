@@ -56,4 +56,13 @@ Needs (drafts in `public/terms.html` are placeholders only):
 
 ## 7. Business structure
 
-Undecided: under Salam Solutions or its own business. Because the platform handles other people's money and disputes, a **separate Pty Ltd** (possibly owned by Salam Solutions) would keep that liability away from Salam's other work. Discuss with an accountant or lawyer.
+**Decided (25 Oct 2026): its own business and brand, run through a separate Pty Ltd**, not under Salam Solutions. This keeps the liability from holding other people's money and handling disputes away from Salam's other work.
+
+To do (owner, with an accountant or lawyer; these cost money and aren't done yet):
+
+- [ ] Check the name is available: ASIC business/company names, IP Australia trade marks, and the domain. "Get It Done" is a common phrase, so it may already be taken or be hard to trade mark. Have a backup name ready.
+- [ ] Register the Pty Ltd (ASIC, about A$600) and get its ABN, plus GST registration when required
+- [ ] Decide who holds the shares (you personally, or a holding entity)
+- [ ] Business bank account in the company's name, which the Stripe account will pay out to
+- [ ] Open Stripe, Cloudflare, domain and insurance accounts **in the company's name**, not Salam Solutions'
+- [ ] Put the company's legal name and ABN into the terms, privacy policy and app footer
