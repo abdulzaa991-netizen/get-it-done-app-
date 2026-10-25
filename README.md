@@ -17,4 +17,4 @@ npx wrangler dev        # open http://localhost:8787
 - [docs/LEGAL.md](docs/LEGAL.md): legal issues to clear before launch
 - [CLAUDE.md](CLAUDE.md): working rules and code conventions
 
-Status: MVP built and tested locally. **Not deployed, and live payments are switched off.**
+Status: **paused**. MVP built and tested locally; not deployed; live payments switched off. See [docs/STATUS.md](docs/STATUS.md) for where it stands and what is next.
