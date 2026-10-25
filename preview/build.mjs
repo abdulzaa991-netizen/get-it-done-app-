@@ -58,7 +58,19 @@ const barJs = `
   const mark = (id) => {
     buttons.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.user === (id || ''))));
     const known = Object.prototype.hasOwnProperty.call(hints, id || '');
-    document.getElementById('pv-hint').textContent = known ? hints[id || ''] : 'You’re signed in as your new account. Try posting a job.';
+    const hint = document.getElementById('pv-hint');
+    if (known) return void (hint.textContent = hints[id || '']);
+    hint.textContent = 'You’re signed in as your new account. In the real app we’d now email you a link to confirm your address. ';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'pv-reset';
+    btn.textContent = 'Pretend I clicked the email link';
+    btn.addEventListener('click', () => {
+      window.gidPreview.verifyMe();
+      hint.textContent = 'Email confirmed. Try posting a job.';
+      window.dispatchEvent(new Event('gid:refresh'));
+    });
+    hint.append(btn);
   };
   const switchTo = (id, start) => {
     window.gidPreview.setUser(id || null);

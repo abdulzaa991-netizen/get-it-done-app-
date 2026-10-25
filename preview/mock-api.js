@@ -7,7 +7,7 @@
   const CATEGORIES = ['Handyman', 'Cleaning', 'Gardening', 'Removals', 'Painting', 'Assembly', 'Electrical', 'Plumbing', 'Carpentry', 'Tiling', 'Roofing', 'Concreting', 'Labour hire', 'Other'];
   const LICENSED = ['Electrical', 'Plumbing', 'Roofing'];
 
-  const user = (o) => ({ suburb: '', postcode: '', bio: '', is_business: 0, business_name: '', abn: '', trades: '', licence_no: '', insured: 0, payouts_enabled: 0, notify_messages: 1, created_at: now - 200 * DAY, ...o });
+  const user = (o) => ({ suburb: '', postcode: '', bio: '', is_business: 0, business_name: '', abn: '', trades: '', licence_no: '', insured: 0, payouts_enabled: 0, notify_messages: 1, email_verified: 1, created_at: now - 200 * DAY, ...o });
   const db = {
     me: 'priya',
     users: [
@@ -56,6 +56,7 @@
   const fail = (s, m) => { throw new Fail(s, m); };
   const me = () => db.users.find((u) => u.id === db.me) || null;
   const requireUser = () => me() || fail(401, 'Please log in');
+  const requireVerified = () => { const u = requireUser(); if (!u.email_verified) fail(403, `Please confirm your email first. We sent a link to ${u.email}.`); return u; };
   const userById = (id) => db.users.find((u) => u.id === id);
   const rating = (id) => {
     const rs = db.reviews.filter((r) => r.reviewee_id === id);
@@ -89,7 +90,7 @@
     ['GET', /^\/meta$/, () => ({ categories: CATEGORIES, licensedCategories: LICENSED, feeBps: FEE_BPS, simulatedPayments: true, autoReleaseDays: 5 })],
     ['GET', /^\/me$/, () => {
       const u = me();
-      return { user: u ? { ...publicUser(u), email: u.email, postcode: u.postcode, notifyMessages: !!u.notify_messages, isAdmin: false } : null };
+      return { user: u ? { ...publicUser(u), email: u.email, postcode: u.postcode, notifyMessages: !!u.notify_messages, emailVerified: !!u.email_verified, isAdmin: false } : null };
     }],
     ['PUT', /^\/me$/, (b) => {
       const u = requireUser();
@@ -106,7 +107,7 @@
       if (String(b.password || '').length < 10) fail(400, 'Password needs at least 10 characters');
       if (b.acceptTerms !== true) fail(400, 'Please accept the terms and privacy policy');
       if (db.users.some((u) => u.email === email)) fail(409, 'An account with that email already exists. Try logging in.');
-      const u = user({ id: crypto.randomUUID(), email, name: str(b.name, 'Name', 80, 2), suburb: b.suburb || '', postcode: b.postcode || '', created_at: Date.now() });
+      const u = user({ id: crypto.randomUUID(), email, name: str(b.name, 'Name', 80, 2), suburb: b.suburb || '', postcode: b.postcode || '', email_verified: 0, created_at: Date.now() });
       db.users.push(u);
       db.me = u.id;
       window.dispatchEvent(new CustomEvent('gid:preview-user', { detail: u.id }));
@@ -114,6 +115,8 @@
     }],
     ['POST', /^\/auth\/logout$/, () => { db.me = null; window.dispatchEvent(new CustomEvent('gid:preview-user', { detail: null })); return { ok: true }; }],
     ['POST', /^\/auth\/forgot$/, () => ({ ok: true })],
+    ['POST', /^\/auth\/verify$/, () => fail(400, 'Confirmation links arrive by email in the real app. The preview doesn’t send email.')],
+    ['POST', /^\/auth\/verify\/resend$/, () => ({ ok: true, alreadyVerified: !!requireUser().email_verified })],
     ['POST', /^\/auth\/reset$/, () => fail(400, 'Reset links arrive by email in the real app. The preview doesn’t send email.')],
     ['POST', /^\/auth\/password$/, (b) => { requireUser(); if (String(b.password || '').length < 10) fail(400, 'Password needs at least 10 characters'); return { ok: true }; }],
     ['GET', /^\/users\/([^/]+)$/, (_, [id]) => {
@@ -138,7 +141,7 @@
       };
     }],
     ['POST', /^\/jobs$/, (b) => {
-      const u = requireUser();
+      const u = requireVerified();
       if (!CATEGORIES.includes(b.category)) fail(400, 'Pick a category');
       const pricing = b.pricing === 'fixed' ? 'fixed' : 'quote';
       let budget = null;
@@ -165,7 +168,7 @@
       };
     }],
     ['POST', /^\/jobs\/([^/]+)\/quotes$/, (b, [id]) => {
-      const u = requireUser(), j = getJob(id);
+      const u = requireVerified(), j = getJob(id);
       if (j.poster_id === u.id) fail(400, 'You can’t quote on your own job');
       if (j.status !== 'open') fail(409, 'This job is no longer taking quotes');
       const amount = j.pricing === 'fixed' ? j.budget_cents : cents(b.amount) ?? fail(400, 'Quote must be between $10 and $50,000');
@@ -180,7 +183,7 @@
       return { ok: true };
     }],
     ['POST', /^\/jobs\/([^/]+)\/accept$/, (b, [id]) => {
-      const u = requireUser(), j = getJob(id);
+      const u = requireVerified(), j = getJob(id);
       if (roleOn(j, u) !== 'poster') fail(403, 'Only the poster can accept a quote');
       const q = db.quotes.find((x) => x.id === b.quoteId && x.job_id === id && x.status === 'pending') || fail(404, 'That quote isn’t available any more');
       move(j, ['open'], 'awaiting_payment', { worker_id: q.worker_id, quote_id: q.id, amount_cents: q.amount_cents, fee_cents: Math.round((q.amount_cents * FEE_BPS) / 10_000) });
@@ -188,7 +191,7 @@
       return { ok: true };
     }],
     ['POST', /^\/jobs\/([^/]+)\/pay$/, (_, [id]) => {
-      const u = requireUser(), j = getJob(id);
+      const u = requireVerified(), j = getJob(id);
       if (roleOn(j, u) !== 'poster') fail(403, 'Only the poster pays for a job');
       move(j, ['awaiting_payment'], 'funded');
       return { simulated: true };
@@ -234,14 +237,14 @@
         .map((m) => ({ id: m.id, senderId: m.sender_id, senderName: userById(m.sender_id).name, body: m.body, createdAt: m.created_at })) };
     }],
     ['POST', /^\/jobs\/([^/]+)\/messages$/, (b, [id]) => {
-      const u = requireUser(), j = getJob(id);
+      const u = requireVerified(), j = getJob(id);
       const worker = roleOn(j, u) === 'poster' ? b.worker : u.id;
       let text = str(b.body, 'Message', 2000, 1);
       if (!['funded', 'done', 'released', 'disputed'].includes(j.status) || worker !== j.worker_id) text = mask(text);
       msg({ job_id: id, worker_id: worker, sender_id: u.id, body: text, created_at: Date.now() });
       return { ok: true };
     }],
-    ['POST', /^\/payouts\/onboard$/, () => { requireUser().payouts_enabled = 1; return { simulated: true }; }],
+    ['POST', /^\/payouts\/onboard$/, () => { requireVerified().payouts_enabled = 1; return { simulated: true }; }],
     ['POST', /^\/payouts\/refresh$/, () => ({ payoutsReady: !!requireUser().payouts_enabled })],
   ];
 
@@ -267,5 +270,5 @@
   };
   const json = (status, data) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 
-  window.gidPreview = { setUser: (id) => { db.me = id; }, currentUser: () => db.me };
+  window.gidPreview = { setUser: (id) => { db.me = id; }, currentUser: () => db.me, verifyMe: () => { if (me()) me().email_verified = 1; } };
 })();

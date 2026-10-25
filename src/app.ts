@@ -23,6 +23,7 @@ interface User {
   stripe_account_id: string | null;
   payouts_enabled: number;
   notify_messages: number;
+  email_verified_at: number | null;
   created_at: number;
 }
 
@@ -95,6 +96,16 @@ function requireUser(c: C): User {
   return u!;
 }
 
+/** For actions that reach other people or move money: the account's email must be confirmed. */
+function requireVerified(c: C): User {
+  const u = requireUser(c);
+  if (!u.email_verified_at) fail(403, `Please confirm your email first. We sent a link to ${u.email}.`);
+  return u;
+}
+
+/** Admin rights need a confirmed email, or anyone could sign up with an admin's address first. */
+const isVerifiedAdmin = (env: Env, u: User) => !!u.email_verified_at && isAdmin(env, u.email);
+
 async function rateLimit(env: Env, key: string, limit: number, windowMs: number) {
   const now = Date.now();
   const row = await env.DB.prepare(`SELECT count, window_start FROM rate_limits WHERE key = ?`).bind(key).first<{ count: number; window_start: number }>();
@@ -163,7 +174,7 @@ function roleOn(job: Job, user: User | null, env: Env): Actor | null {
   if (!user) return null;
   if (user.id === job.poster_id) return 'poster';
   if (user.id === job.worker_id) return 'worker';
-  if (isAdmin(env, user.email)) return 'admin';
+  if (isVerifiedAdmin(env, user)) return 'admin';
   return null;
 }
 
@@ -241,8 +252,41 @@ app.post('/api/auth/signup', async (c) => {
     `INSERT INTO users (id, email, password_hash, name, suburb, postcode, terms_accepted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(id, email, await hashPassword(password), name, str(b.suburb, 'Suburb', 60), b.postcode ? postcode(b.postcode) : '', now, now).run();
   await startSession(c, id);
-  defer(c, notify.welcome(c.env, email, name));
+  defer(c, sendVerification(c.env, { id, email, name }, true));
   return c.json({ ok: true }, 201);
+});
+
+const VERIFY_TTL_MS = 24 * 3_600_000;
+
+/** Issues a fresh verification link (cancelling older ones) and emails it. */
+async function sendVerification(env: Env, u: { id: string; email: string; name: string }, isNewAccount: boolean) {
+  const token = randomToken();
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM email_verifications WHERE user_id = ?`).bind(u.id),
+    env.DB.prepare(`INSERT INTO email_verifications (token_hash, user_id, expires_at) VALUES (?, ?, ?)`).bind(await sha256(token), u.id, Date.now() + VERIFY_TTL_MS),
+  ]);
+  // Token in the URL fragment, like reset links: never sent to servers or in Referer headers.
+  await notify.verifyEmail(env, u.email, u.name, `${env.APP_URL}/#/verify?token=${token}`, isNewAccount);
+}
+
+// Doesn't need a session: people often open the link on a different device from where they signed up.
+app.post('/api/auth/verify', async (c) => {
+  await rateLimit(c.env, `verify:${clientIp(c)}`, 30, 3_600_000);
+  const tokenHash = await sha256(String((await body(c)).token ?? ''));
+  const claimed = await c.env.DB.prepare(`DELETE FROM email_verifications WHERE token_hash = ? AND expires_at > ? RETURNING user_id`)
+    .bind(tokenHash, Date.now())
+    .first<{ user_id: string }>();
+  if (!claimed) fail(400, 'This link has expired or already been used. Log in and ask for a new one from the banner at the top.');
+  await c.env.DB.prepare(`UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?`).bind(Date.now(), claimed!.user_id).run();
+  return c.json({ ok: true });
+});
+
+app.post('/api/auth/verify/resend', async (c) => {
+  const u = requireUser(c);
+  if (u.email_verified_at) return c.json({ ok: true, alreadyVerified: true });
+  await rateLimit(c.env, `verify-resend:${u.id}`, 3, 3_600_000);
+  defer(c, sendVerification(c.env, u, false));
+  return c.json({ ok: true });
 });
 
 app.post('/api/auth/login', async (c) => {
@@ -298,7 +342,8 @@ app.post('/api/auth/reset', async (c) => {
   if (!claimed) fail(400, 'This reset link has expired or already been used. Please ask for a new one.');
   const u = (await c.env.DB.prepare(`SELECT id, email, name FROM users WHERE id = ?`).bind(claimed!.user_id).first<{ id: string; email: string; name: string }>())!;
   await c.env.DB.batch([
-    c.env.DB.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).bind(await hashPassword(password), u.id),
+    // Using a link we emailed also proves they own the address.
+    c.env.DB.prepare(`UPDATE users SET password_hash = ?, email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?`).bind(await hashPassword(password), Date.now(), u.id),
     // Log out everywhere: whoever had the old password loses access.
     c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(u.id),
     c.env.DB.prepare(`DELETE FROM password_resets WHERE user_id = ?`).bind(u.id),
@@ -345,7 +390,8 @@ app.get('/api/me', async (c) => {
       email: u.email,
       postcode: u.postcode,
       notifyMessages: !!u.notify_messages,
-      isAdmin: isAdmin(c.env, u.email),
+      emailVerified: !!u.email_verified_at,
+      isAdmin: isVerifiedAdmin(c.env, u),
     },
   });
 });
@@ -413,7 +459,7 @@ app.get('/api/jobs/mine', async (c) => {
 });
 
 app.post('/api/jobs', async (c) => {
-  const u = requireUser(c);
+  const u = requireVerified(c);
   await rateLimit(c.env, `post:${u.id}`, 20, 86_400_000);
   const b = await body(c);
   const kind = b.kind === 'trade' ? 'trade' : 'home';
@@ -509,7 +555,7 @@ app.get('/api/jobs/:id', async (c) => {
 });
 
 app.post('/api/jobs/:id/quotes', async (c) => {
-  const u = requireUser(c);
+  const u = requireVerified(c);
   const job = await getJob(c.env, c.req.param('id'));
   if (job.poster_id === u.id) fail(400, 'You can’t quote on your own job');
   if (job.status !== 'open') fail(409, 'This job is no longer taking quotes');
@@ -537,7 +583,7 @@ app.post('/api/jobs/:id/quotes/withdraw', async (c) => {
 });
 
 app.post('/api/jobs/:id/accept', async (c) => {
-  const u = requireUser(c);
+  const u = requireVerified(c);
   const job = await getJob(c.env, c.req.param('id'));
   if (roleOn(job, u, c.env) !== 'poster') fail(403, 'Only the poster can accept a quote');
   const b = await body(c);
@@ -560,7 +606,7 @@ app.post('/api/jobs/:id/accept', async (c) => {
 });
 
 app.post('/api/jobs/:id/pay', async (c) => {
-  const u = requireUser(c);
+  const u = requireVerified(c);
   const job = await getJob(c.env, c.req.param('id'));
   if (roleOn(job, u, c.env) !== 'poster') fail(403, 'Only the poster pays for a job');
   if (job.status !== 'awaiting_payment') fail(409, 'This job isn’t waiting for payment');
@@ -683,6 +729,7 @@ app.get('/api/jobs/:id/messages', async (c) => {
 });
 
 app.post('/api/jobs/:id/messages', async (c) => {
+  requireVerified(c);
   const b = await body(c);
   const { u, job, workerId } = await threadFor(c, b.worker);
   if (u.id === job.poster_id && workerId === u.id) fail(400, 'Pick who to message');
@@ -705,7 +752,7 @@ app.post('/api/jobs/:id/messages', async (c) => {
 // ---------- payouts (Stripe Connect Express) ----------
 
 app.post('/api/payouts/onboard', async (c) => {
-  const u = requireUser(c);
+  const u = requireVerified(c);
   if (isSimulated(c.env)) {
     await c.env.DB.prepare(`UPDATE users SET payouts_enabled = 1 WHERE id = ?`).bind(u.id).run();
     return c.json({ simulated: true });
@@ -761,7 +808,7 @@ app.post('/api/stripe/webhook', async (c) => {
 
 function requireAdmin(c: C) {
   const u = requireUser(c);
-  if (!isAdmin(c.env, u.email)) fail(403, 'Admins only');
+  if (!isVerifiedAdmin(c.env, u)) fail(403, 'Admins only');
   return u;
 }
 

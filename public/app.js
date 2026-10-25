@@ -22,7 +22,25 @@ function h(tag, attrs = {}, ...kids) {
 
 const clean = (kids) => kids.flat().filter((k) => k != null && k !== false);
 /** Replaces the page content, skipping null/false so conditional sections can be inline. */
-const show = (...kids) => view.replaceChildren(...clean(kids));
+const show = (...kids) => view.replaceChildren(...clean([unverifiedBanner(), kids]));
+
+const needsVerify = () => !!state.me && !state.me.emailVerified;
+
+/** Shown on every page until the account's email is confirmed. */
+function unverifiedBanner() {
+  if (!needsVerify() || location.hash.startsWith('#/verify')) return null;
+  return h('div', { class: 'notice' },
+    h('strong', {}, 'Confirm your email. '),
+    `We sent a link to ${state.me.email}. You’ll need it before you can post jobs, quote or message.`,
+    h('div', { style: 'margin-top:8px' }, h('button', { type: 'button', class: 'secondary', onclick: action(async () => {
+      const r = await api('/auth/verify/resend', { body: {} });
+      if (r.alreadyVerified) { await loadMe(); render(); return; }
+      toast('Sent. Check your inbox (and spam folder).');
+    }) }, 'Resend email')));
+}
+
+/** In place of a form an unverified account can't submit yet. */
+const verifyFirst = (what) => h('p', { class: 'card muted' }, `Confirm your email to ${what}. Use the link we sent, or resend it from the banner above.`);
 
 async function api(path, opts = {}) {
   const res = await fetch(`/api${path}`, {
@@ -185,6 +203,7 @@ async function browseView() {
 
 async function postView() {
   if (!state.me) return go('#/login');
+  if (needsVerify()) return show(h('h1', {}, 'Post a job'), verifyFirst('post a job'));
   const kindNote = h('p', { class: 'muted' });
   const licNote = h('div', { class: 'notice', hidden: true }, 'This kind of work usually needs a licensed tradesperson in Australia. Check the worker’s licence number before you accept a quote.');
   const budgetHint = h('p', { class: 'muted' });
@@ -342,6 +361,8 @@ async function jobView(id) {
             : null),
       ));
     }
+  } else if (me && job.status === 'open' && needsVerify()) {
+    sections.push(verifyFirst('send a quote'));
   } else if (me && job.status === 'open') {
     const mine = quotes[0];
     const qf = h('form', { class: 'card', onsubmit: action(async () => {
@@ -574,6 +595,31 @@ function resetView() {
     resetView.token ? form : h('p', {}, 'This link is incomplete. ', h('a', { href: '#/forgot' }, 'Ask for a new one.')));
 }
 
+async function verifyView() {
+  const page = state.page;
+  const token = new URLSearchParams(location.hash.split('?')[1] || '').get('token') || verifyView.token || '';
+  // Keep the token out of the address bar and history once read.
+  history.replaceState(null, '', '#/verify');
+  verifyView.token = token;
+  if (!token) return show(h('h1', {}, 'Confirm your email'), h('p', {}, 'This link is incomplete. Log in and use “Resend email” to get a new one.'));
+  try {
+    await api('/auth/verify', { body: { token } });
+  } catch (err) {
+    if (movedOn(page)) return;
+    verifyView.token = '';
+    return show(h('h1', {}, 'Link didn’t work'), h('p', {}, err.message),
+      h('a', { class: 'btn block', href: state.me ? '#/' : '#/login' }, state.me ? 'Back to jobs' : 'Log in'));
+  }
+  verifyView.token = '';
+  if (state.me) await loadMe();
+  if (movedOn(page)) return;
+  show(h('h1', {}, 'Email confirmed'),
+    h('p', {}, 'Thanks. You can now post jobs, quote and message.'),
+    state.me
+      ? h('div', { class: 'actions' }, h('a', { class: 'btn', href: '#/post' }, 'Post a job'), h('a', { class: 'btn secondary', href: '#/' }, 'Browse jobs'))
+      : h('a', { class: 'btn block', href: '#/login' }, 'Log in'));
+}
+
 async function adminView() {
   const page = state.page;
   const { disputes } = await api('/admin/disputes');
@@ -611,7 +657,7 @@ async function render() {
   const parts = (path || '/').split('/').filter(Boolean);
   const tab = { '': 'browse', post: 'post', mine: 'mine', profile: 'profile' }[parts[0] ?? ''];
   document.querySelectorAll('.tabs a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab));
-  if (!['login', 'signup', 'forgot', 'reset'].includes(parts[0])) session.set('after', location.hash || '#/');
+  if (!['login', 'signup', 'forgot', 'reset', 'verify'].includes(parts[0])) session.set('after', location.hash || '#/');
   try {
     if (!parts.length) await browseView();
     else if (parts[0] === 'post') await postView();
@@ -622,6 +668,7 @@ async function render() {
     else if (parts[0] === 'login' || parts[0] === 'signup') authView(parts[0]);
     else if (parts[0] === 'forgot') forgotView();
     else if (parts[0] === 'reset') resetView();
+    else if (parts[0] === 'verify') await verifyView();
     else if (parts[0] === 'admin') await adminView();
     else show(h('p', { class: 'empty' }, 'Page not found.'));
   } catch (err) {

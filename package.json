@@ -10,7 +10,7 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "e2e": "node scripts/e2e.mjs",
+    "e2e": "npm run db:clear-limits:local --silent && node scripts/e2e.mjs",
     "db:clear-limits:local": "wrangler d1 execute get-it-done --local --command \"DELETE FROM rate_limits\""
   },
   "devDependencies": {

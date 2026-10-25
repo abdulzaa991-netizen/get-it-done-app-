@@ -21,7 +21,9 @@ A two-sided local jobs marketplace (trade overflow + home jobs). Cloudflare Work
 - Front end: `public/`, no build step. Build DOM with `h()` (textContent only); never `innerHTML` with user data.
 - Public user data goes through `publicUser()`; email, address and payout details are never public.
 - Emails: add them to `src/notify.ts` and send with `defer(c, ...)`. They must never throw or block the action. No `RESEND_API_KEY` = nothing is sent.
-- Never log email bodies (they contain reset links).
+- Never log email bodies (they contain reset and verification links).
+- Anything that reaches other people or moves money uses `requireVerified(c)`, not just `requireUser(c)`. Admin checks use `isVerifiedAdmin()`.
+- `preview/` is a clickable demo (mock API in the browser). When an API response changes, update `preview/mock-api.js` to match. Build it with `node preview/build.mjs <out.html>`.
 
 ## Commands
 

@@ -37,13 +37,14 @@ I didn't find anything better for this stage. One option to consider later is Du
 - [x] **Live payments locked:** a live Stripe key is refused unless `ALLOW_LIVE_PAYMENTS=true` is set, which needs owner approval
 - [x] Rate limits on signup, login, posting and messages; CSRF protection; CSP and security headers
 - [x] Password reset by email (single-use link, expires in 1 hour, logs out all devices) and change password in the profile
-- [x] Email notifications: welcome, new quote, quote accepted, payment held, marked done, paid, dispute raised/resolved, new message (at most one per conversation every 15 min, can be turned off)
-- [x] Unit tests (state machine, money, crypto, webhook signatures) + a 76-check end-to-end test
+- [x] Email notifications: welcome + confirm email, new quote, quote accepted, payment held, marked done, paid, dispute raised/resolved, new message (at most one per conversation every 15 min, can be turned off)
+- [x] Email verification: new accounts confirm their address (link valid 24 hours) before they can post, quote, message, accept, pay or set up payouts. Browsing works without it. Admin rights need a confirmed email
+- [x] Unit tests (state machine, money, crypto, webhook signatures) + a 104-check end-to-end test
 
 ## Can wait (after MVP)
 
 1. ~~Email notifications~~ and ~~password reset~~: **built**. They need an email provider account before emails really go out (see Setup)
-2. Email verification on signup (confirm the address is real before someone can post or quote)
+2. ~~Email verification on signup~~: **built**
 3. Photo uploads on jobs and on completion (Cloudflare R2)
 4. Verification: ABN lookup (ABR web services, free), licence checks per state register, insurance certificate upload
 5. Push notifications, and an app-store wrapper (Capacitor) if the PWA isn't enough

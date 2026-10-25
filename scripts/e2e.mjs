@@ -43,14 +43,29 @@ async function hasEmail(addr, subjectPart) {
 }
 
 const poster = client(), worker = client(), other = client(), admin = client(), anon = client();
-const signup = (c, who) => c('/auth/signup', { email: `${who}-${run}@test.local`, password: 'longenough123', name: who, suburb: 'Parramatta', postcode: '2150', acceptTerms: true });
+/** Follows the newest verification link emailed to addr. */
+async function verifyEmail(addr) {
+  for (let i = 0; i < 20; i++) {
+    const mail = (await emailsTo(addr, 0)).find((e) => e.subject.includes('confirm your email') || e.subject.includes('Confirm your email'));
+    const token = mail?.body.match(/#\/verify\?token=([a-f0-9]{64})/)?.[1];
+    if (token) return (await anon('/auth/verify', { token })).status;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return 0;
+}
+const signupRaw = (c, who) => c('/auth/signup', { email: `${who}-${run}@test.local`, password: 'longenough123', name: who, suburb: 'Parramatta', postcode: '2150', acceptTerms: true });
+const signup = async (c, who) => {
+  const r = await signupRaw(c, who);
+  if (r.status === 201) await verifyEmail(emailOf(who));
+  return r;
+};
 
 check('poster signs up', (await signup(poster, 'Pat')).status === 201);
 check('worker signs up', (await signup(worker, 'Wes')).status === 201);
 check('other signs up', (await signup(other, 'Ola')).status === 201);
-await admin('/auth/signup', { email: 'admin@test.local', password: 'longenough123', name: 'Admin', acceptTerms: true });
+if ((await admin('/auth/signup', { email: 'admin@test.local', password: 'longenough123', name: 'Admin', acceptTerms: true })).status === 201) await verifyEmail('admin@test.local');
 check('admin logs in', (await admin('/auth/login', { email: 'admin@test.local', password: 'longenough123' })).status === 200);
-check('welcome email sent', await hasEmail(emailOf('Pat'), 'Welcome'));
+check('welcome + confirm email sent', await hasEmail(emailOf('Pat'), 'Welcome to Get It Done: please confirm your email'));
 check('signup needs terms', (await anon('/auth/signup', { email: `x${run}@t.local`, password: 'longenough123', name: 'X' })).status === 400);
 check('wrong password rejected', (await anon('/auth/login', { email: `pat-${run}@test.local`, password: 'nope' })).status === 401);
 check('form-encoded POST rejected (CSRF)', (await fetch(BASE + '/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'a=1' })).status === 400);
@@ -176,6 +191,34 @@ check('change password: wrong current rejected', (await resetter('/auth/password
 check('change password works', (await resetter('/auth/password', { current: 'brandnewpass1', password: 'thirdpassword1' })).status === 200);
 check('still logged in after change', (await resetter('/me')).data.user?.name === 'Rita');
 check('message emails can be turned off', (await resetter('/me', { name: 'Rita', notifyMessages: false }, 'PUT')).status === 200 && (await resetter('/me')).data.user.notifyMessages === false);
+
+// Email verification
+const vic = client();
+check('vic signs up (not verified yet)', (await signupRaw(vic, 'Vic')).status === 201);
+check('vic is unverified', (await vic('/me')).data.user.emailVerified === false);
+const jobBody = { kind: 'home', category: 'Handyman', title: 'Hang three picture frames', description: 'Plaster walls, frames and hooks supplied, about 30 minutes.', suburb: 'Parramatta', postcode: '2150', pricing: 'fixed', budget: '60' };
+check('unverified cannot post a job', (await vic('/jobs', jobBody)).status === 403);
+check('unverified cannot quote', (await vic(`/jobs/${job3}/quotes`, { amount: '50' })).status === 403);
+check('unverified cannot set up payouts', (await vic('/payouts/onboard', {})).status === 403);
+check('unverified can still browse', (await vic('/jobs')).status === 200);
+check('unverified admin email gets no admin rights', (await vic('/admin/disputes')).status === 403);
+const firstLink = (await emailsTo(emailOf('Vic'))).find((e) => e.subject.includes('confirm'))?.body.match(/token=([a-f0-9]{64})/)?.[1];
+check('resend works', (await vic('/auth/verify/resend', {})).status === 200);
+await new Promise((r) => setTimeout(r, 400));
+check('resent link cancels the first', (await anon('/auth/verify', { token: firstLink })).status === 400);
+check('bad token rejected', (await anon('/auth/verify', { token: 'a'.repeat(64) })).status === 400);
+const secondLink = (await emailsTo(emailOf('Vic'), 2)).find((e) => e.subject === 'Confirm your email for Get It Done')?.body.match(/token=([a-f0-9]{64})/)?.[1];
+check('verify works without being logged in', (await anon('/auth/verify', { token: secondLink })).status === 200);
+check('link is single use', (await anon('/auth/verify', { token: secondLink })).status === 400);
+check('vic is now verified', (await vic('/me')).data.user.emailVerified === true);
+check('verified can post', (await vic('/jobs', jobBody)).status === 201);
+check('resend after verifying is a no-op', (await vic('/auth/verify/resend', {})).data.alreadyVerified === true);
+const una = client();
+await signupRaw(una, 'Una');
+await anon('/auth/forgot', { email: emailOf('Una') });
+const unaReset = (await emailsTo(emailOf('Una'), 2)).find((e) => e.subject.includes('Reset'))?.body.match(/token=([a-f0-9]{64})/)?.[1];
+await anon('/auth/reset', { token: unaReset, password: 'unasnewpass1' });
+check('password reset also confirms the email', (await anon('/auth/login', { email: emailOf('Una'), password: 'unasnewpass1' })).status === 200 && (await anon('/me')).data.user.emailVerified === true);
 
 console.log(failures ? `\n${failures} FAILED` : '\nAll checks passed');
 process.exit(failures ? 1 : 0);

@@ -34,11 +34,11 @@ async function safely(fn: () => Promise<void>) {
 }
 
 export const notify = {
-  welcome: (env: Env, to: string, name: string) =>
+  verifyEmail: (env: Env, to: string, name: string, link: string, isNewAccount: boolean) =>
     trySend(env, {
       to,
-      subject: 'Welcome to Get It Done',
-      text: `Hi ${name},\n\nYour account is ready. Post a job, or set up payouts in your profile to start quoting on jobs near you.\n\n${env.APP_URL}`,
+      subject: isNewAccount ? 'Welcome to Get It Done: please confirm your email' : 'Confirm your email for Get It Done',
+      text: `Hi ${name},\n\n${isNewAccount ? 'Thanks for joining. ' : ''}Please confirm this is your email address. You'll need to before you can post jobs, quote or message:\n\n${link}\n\nThe link works once and expires in 24 hours. If you didn't create a Get It Done account, ignore this email.`,
     }),
 
   passwordReset: (env: Env, to: string, name: string, link: string) =>
