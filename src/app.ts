@@ -3,6 +3,7 @@ import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { Env, feeBps, isAdmin, isSimulated } from './env';
 import { hashPassword, newId, randomToken, sha256, verifyPassword } from './lib/crypto';
 import { CATEGORIES, LICENSED_CATEGORIES, dollarsToCents, maskContactDetails, platformFee, transition, type Actor, type JobAction, type JobStatus } from './lib/rules';
+import { notify } from './notify';
 import { markFunded, refundPayment, releasePayment } from './payments';
 import { stripeFor, verifyStripeWebhook } from './stripe';
 
@@ -21,6 +22,7 @@ interface User {
   insured: number;
   stripe_account_id: string | null;
   payouts_enabled: number;
+  notify_messages: number;
   created_at: number;
 }
 
@@ -104,7 +106,29 @@ async function rateLimit(env: Env, key: string, limit: number, windowMs: number)
   await env.DB.prepare(`UPDATE rate_limits SET count = count + 1 WHERE key = ?`).bind(key).run();
 }
 
+/** True the first time a key is seen in each window. Used to throttle message emails without failing the request. */
+async function firstInWindow(env: Env, key: string, windowMs: number): Promise<boolean> {
+  const now = Date.now();
+  const r = await env.DB.prepare(
+    `INSERT INTO rate_limits (key, count, window_start) VALUES (?1, 1, ?2)
+     ON CONFLICT (key) DO UPDATE SET count = 1, window_start = ?2 WHERE rate_limits.window_start < ?3`,
+  ).bind(key, now, now - windowMs).run();
+  return r.meta.changes === 1;
+}
+
 const clientIp = (c: C) => c.req.header('CF-Connecting-IP') ?? 'local';
+
+/** Runs work (e.g. sending email) after the response, so the user isn't kept waiting. */
+const defer = (c: C, work: Promise<unknown>) => c.executionCtx.waitUntil(work);
+
+const adminEmails = (env: Env) => (env.ADMIN_EMAILS || '').split(',').map((e) => e.trim()).filter(Boolean);
+
+function checkNewPassword(v: unknown): string {
+  const password = typeof v === 'string' ? v : '';
+  if (password.length < 10) fail(400, 'Password needs at least 10 characters');
+  if (password.length > 200) fail(400, 'Password is too long');
+  return password;
+}
 
 /** What anyone can see about a user. Email, address and payout details are never public. */
 function publicUser(u: User, rating?: { avg: number | null; count: number }) {
@@ -206,9 +230,7 @@ app.post('/api/auth/signup', async (c) => {
   const b = await body(c);
   const email = str(b.email, 'Email', 200, 3).toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail(400, 'That email doesn’t look right');
-  const password = typeof b.password === 'string' ? b.password : '';
-  if (password.length < 10) fail(400, 'Password needs at least 10 characters');
-  if (password.length > 200) fail(400, 'Password is too long');
+  const password = checkNewPassword(b.password);
   if (b.acceptTerms !== true) fail(400, 'Please accept the terms and privacy policy');
   const name = str(b.name, 'Name', 80, 2);
   const id = newId();
@@ -219,6 +241,7 @@ app.post('/api/auth/signup', async (c) => {
     `INSERT INTO users (id, email, password_hash, name, suburb, postcode, terms_accepted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(id, email, await hashPassword(password), name, str(b.suburb, 'Suburb', 60), b.postcode ? postcode(b.postcode) : '', now, now).run();
   await startSession(c, id);
+  defer(c, notify.welcome(c.env, email, name));
   return c.json({ ok: true }, 201);
 });
 
@@ -241,6 +264,66 @@ app.post('/api/auth/logout', async (c) => {
   return c.json({ ok: true });
 });
 
+const RESET_TTL_MS = 3_600_000;
+
+// Always answers the same way, so it can't be used to find out who has an account.
+app.post('/api/auth/forgot', async (c) => {
+  const b = await body(c);
+  const email = str(b.email, 'Email', 200, 3).toLowerCase();
+  await rateLimit(c.env, `forgot:${clientIp(c)}`, 10, 3_600_000);
+  await rateLimit(c.env, `forgot:${email}`, 3, 3_600_000);
+  const u = await c.env.DB.prepare(`SELECT id, name FROM users WHERE email = ?`).bind(email).first<{ id: string; name: string }>();
+  if (u) {
+    const token = randomToken();
+    // One live link at a time: asking again cancels earlier links.
+    await c.env.DB.batch([
+      c.env.DB.prepare(`DELETE FROM password_resets WHERE user_id = ?`).bind(u.id),
+      c.env.DB.prepare(`INSERT INTO password_resets (token_hash, user_id, expires_at) VALUES (?, ?, ?)`).bind(await sha256(token), u.id, Date.now() + RESET_TTL_MS),
+    ]);
+    // The token goes in the URL fragment (#), which browsers never send to servers or in Referer headers.
+    defer(c, notify.passwordReset(c.env, email, u.name, `${c.env.APP_URL}/#/reset?token=${token}`));
+  }
+  return c.json({ ok: true });
+});
+
+app.post('/api/auth/reset', async (c) => {
+  await rateLimit(c.env, `reset:${clientIp(c)}`, 20, 3_600_000);
+  const b = await body(c);
+  const password = checkNewPassword(b.password);
+  const tokenHash = await sha256(String(b.token ?? ''));
+  // Claim the token atomically so it can only ever be used once.
+  const claimed = await c.env.DB.prepare(
+    `UPDATE password_resets SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND expires_at > ?1 RETURNING user_id`,
+  ).bind(Date.now(), tokenHash).first<{ user_id: string }>();
+  if (!claimed) fail(400, 'This reset link has expired or already been used. Please ask for a new one.');
+  const u = (await c.env.DB.prepare(`SELECT id, email, name FROM users WHERE id = ?`).bind(claimed!.user_id).first<{ id: string; email: string; name: string }>())!;
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).bind(await hashPassword(password), u.id),
+    // Log out everywhere: whoever had the old password loses access.
+    c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(u.id),
+    c.env.DB.prepare(`DELETE FROM password_resets WHERE user_id = ?`).bind(u.id),
+  ]);
+  await startSession(c, u.id);
+  defer(c, notify.passwordChanged(c.env, u.email, u.name));
+  return c.json({ ok: true });
+});
+
+app.post('/api/auth/password', async (c) => {
+  const u = requireUser(c);
+  await rateLimit(c.env, `pwchange:${u.id}`, 10, 900_000);
+  const b = await body(c);
+  const row = (await c.env.DB.prepare(`SELECT password_hash FROM users WHERE id = ?`).bind(u.id).first<{ password_hash: string }>())!;
+  if (!(await verifyPassword(String(b.current ?? ''), row.password_hash))) fail(400, 'Your current password is wrong');
+  const password = checkNewPassword(b.password);
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).bind(await hashPassword(password), u.id),
+    c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(u.id),
+  ]);
+  await startSession(c, u.id);
+  defer(c, notify.passwordChanged(c.env, u.email, u.name));
+  return c.json({ ok: true });
+});
+
 // ---------- meta & profiles ----------
 
 app.get('/api/meta', (c) =>
@@ -257,7 +340,13 @@ app.get('/api/me', async (c) => {
   const u = c.get('user');
   if (!u) return c.json({ user: null });
   return c.json({
-    user: { ...publicUser(u, await ratingFor(c.env, u.id)), email: u.email, postcode: u.postcode, isAdmin: isAdmin(c.env, u.email) },
+    user: {
+      ...publicUser(u, await ratingFor(c.env, u.id)),
+      email: u.email,
+      postcode: u.postcode,
+      notifyMessages: !!u.notify_messages,
+      isAdmin: isAdmin(c.env, u.email),
+    },
   });
 });
 
@@ -267,7 +356,7 @@ app.put('/api/me', async (c) => {
   const abn = str(b.abn, 'ABN', 14).replace(/\s/g, '');
   if (abn && !/^\d{11}$/.test(abn)) fail(400, 'ABN must be 11 digits');
   await c.env.DB.prepare(
-    `UPDATE users SET name = ?, suburb = ?, postcode = ?, bio = ?, is_business = ?, business_name = ?, abn = ?, trades = ?, licence_no = ?, insured = ? WHERE id = ?`,
+    `UPDATE users SET name = ?, suburb = ?, postcode = ?, bio = ?, is_business = ?, business_name = ?, abn = ?, trades = ?, licence_no = ?, insured = ?, notify_messages = ? WHERE id = ?`,
   ).bind(
     str(b.name, 'Name', 80, 2),
     str(b.suburb, 'Suburb', 60),
@@ -279,6 +368,7 @@ app.put('/api/me', async (c) => {
     str(b.trades, 'Trades', 200),
     str(b.licenceNo, 'Licence number', 40),
     b.insured ? 1 : 0,
+    b.notifyMessages === false ? 0 : 1,
     u.id,
   ).run();
   return c.json({ ok: true });
@@ -428,11 +518,15 @@ app.post('/api/jobs/:id/quotes', async (c) => {
   const amount = job.pricing === 'fixed' ? job.budget_cents! : dollarsToCents(b.amount);
   if (amount === null) fail(400, 'Quote must be between $10 and $50,000');
   const message = maskContactDetails(str(b.message, 'Message', 1000));
+  const existing = await c.env.DB.prepare(`SELECT status FROM quotes WHERE job_id = ? AND worker_id = ?`).bind(job.id, u.id).first<{ status: string }>();
+  if (existing && !['pending', 'withdrawn'].includes(existing.status)) fail(409, 'You can’t change this quote any more');
   await c.env.DB.prepare(
     `INSERT INTO quotes (id, job_id, worker_id, amount_cents, message, created_at) VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT (job_id, worker_id) DO UPDATE SET amount_cents = excluded.amount_cents, message = excluded.message, status = 'pending', created_at = excluded.created_at
      WHERE quotes.status IN ('pending', 'withdrawn')`,
   ).bind(newId(), job.id, u.id, amount, message, Date.now()).run();
+  // Email the poster on a new quote (or a re-submitted one), not on every edit of a pending quote.
+  if (existing?.status !== 'pending') defer(c, notify.newQuote(c.env, job.id, u.business_name || u.name, amount!));
   return c.json({ ok: true }, 201);
 });
 
@@ -461,6 +555,7 @@ app.post('/api/jobs/:id/accept', async (c) => {
     c.env.DB.prepare(`UPDATE quotes SET status = 'accepted' WHERE id = ?`).bind(quote!.id),
     c.env.DB.prepare(`UPDATE quotes SET status = 'declined' WHERE job_id = ? AND id != ? AND status = 'pending'`).bind(job.id, quote!.id),
   ]);
+  defer(c, notify.quoteAccepted(c.env, job.id));
   return c.json({ ok: true });
 });
 
@@ -477,7 +572,7 @@ app.post('/api/jobs/:id/pay', async (c) => {
   ).bind(paymentId, job.id, job.amount_cents, job.fee_cents, simulated ? 1 : 0, now, now).run();
 
   if (simulated) {
-    await markFunded(c.env, paymentId, null);
+    if ((await markFunded(c.env, paymentId, null)) === 'funded') defer(c, notify.funded(c.env, job.id));
     return c.json({ simulated: true });
   }
   const base = c.env.APP_URL;
@@ -508,6 +603,7 @@ app.post('/api/jobs/:id/done', async (c) => {
   const job = await getJob(c.env, c.req.param('id'));
   if (roleOn(job, u, c.env) !== 'worker') fail(403, 'Only the hired worker can mark the job done');
   await moveJob(c.env, job, 'mark_done', 'worker', { done_at: Date.now() });
+  defer(c, notify.markedDone(c.env, job.id, Number(c.env.AUTO_RELEASE_DAYS || 5)));
   return c.json({ ok: true });
 });
 
@@ -517,6 +613,7 @@ app.post('/api/jobs/:id/confirm', async (c) => {
   if (roleOn(job, u, c.env) !== 'poster') fail(403, 'Only the poster can confirm the job is done');
   if (!transition(job.status, 'confirm', 'poster')) fail(409, 'The worker hasn’t marked this job done yet');
   if (!(await releasePayment(c.env, job.id, ['done']))) fail(409, 'Payment already released or not held');
+  defer(c, notify.released(c.env, job.id));
   return c.json({ ok: true });
 });
 
@@ -530,6 +627,7 @@ app.post('/api/jobs/:id/dispute', async (c) => {
   await c.env.DB.prepare(`INSERT INTO disputes (id, job_id, raised_by, reason, created_at) VALUES (?, ?, ?, ?, ?)`)
     .bind(newId(), job.id, u.id, reason, Date.now())
     .run();
+  defer(c, notify.disputed(c.env, job.id, role === 'poster', adminEmails(c.env)));
   return c.json({ ok: true });
 });
 
@@ -595,6 +693,12 @@ app.post('/api/jobs/:id/messages', async (c) => {
   await c.env.DB.prepare(`INSERT INTO messages (id, job_id, worker_id, sender_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
     .bind(newId(), job.id, workerId, u.id, text, Date.now())
     .run();
+
+  const recipientId = u.id === job.poster_id ? workerId : job.poster_id;
+  const recipient = await c.env.DB.prepare(`SELECT email, name, notify_messages FROM users WHERE id = ?`).bind(recipientId).first<{ email: string; name: string; notify_messages: number }>();
+  if (recipient?.notify_messages && (await firstInWindow(c.env, `msgmail:${job.id}:${workerId}:${recipientId}`, 900_000))) {
+    defer(c, notify.newMessage(c.env, { jobId: job.id, to: recipient.email, toName: recipient.name, fromName: u.name, body: text, link: `${c.env.APP_URL}/#/jobs/${job.id}` }));
+  }
   return c.json({ ok: true }, 201);
 });
 
@@ -637,7 +741,10 @@ app.post('/api/stripe/webhook', async (c) => {
     const obj = event.data?.object ?? {};
     if (event.type === 'checkout.session.completed' && obj.payment_status === 'paid') {
       const p = await c.env.DB.prepare(`SELECT id FROM payments WHERE checkout_session_id = ?`).bind(obj.id).first<{ id: string }>();
-      if (p) await markFunded(c.env, p.id, obj.payment_intent);
+      if (p && (await markFunded(c.env, p.id, obj.payment_intent)) === 'funded') {
+        const job = await c.env.DB.prepare(`SELECT job_id FROM payments WHERE id = ?`).bind(p.id).first<{ job_id: string }>();
+        if (job) defer(c, notify.funded(c.env, job.job_id));
+      }
     } else if (event.type === 'account.updated') {
       const ready = obj.payouts_enabled && obj.capabilities?.transfers === 'active';
       await c.env.DB.prepare(`UPDATE users SET payouts_enabled = ? WHERE stripe_account_id = ?`).bind(ready ? 1 : 0, obj.id).run();
@@ -678,7 +785,21 @@ app.post('/api/admin/disputes/:id/resolve', async (c) => {
   await c.env.DB.prepare(`UPDATE disputes SET resolution = ?, resolved_at = ? WHERE id = ?`)
     .bind(`${outcome}: ${str(b.note, 'Note', 1000)}`, Date.now(), d!.id)
     .run();
+  defer(c, notify.resolved(c.env, d!.job_id, outcome));
   return c.json({ ok: true });
+});
+
+// ---------- local development only ----------
+
+// Emails captured instead of sent. Double-guarded: needs DEV_OUTBOX=true, no email provider key,
+// AND a localhost request, so it can't leak reset links on a deployed site even if misconfigured.
+app.get('/api/dev/outbox', async (c) => {
+  const host = new URL(c.req.url).hostname;
+  if (c.env.DEV_OUTBOX !== 'true' || c.env.RESEND_API_KEY || !['localhost', '127.0.0.1'].includes(host)) fail(404, 'Not found');
+  const { results } = await c.env.DB.prepare(`SELECT to_email AS "to", subject, body, created_at AS createdAt FROM dev_outbox WHERE to_email = ? ORDER BY created_at DESC LIMIT 50`)
+    .bind(String(c.req.query('to') ?? '').toLowerCase())
+    .all();
+  return c.json({ emails: results });
 });
 
 app.all('/api/*', (c) => c.json({ error: 'Not found' }, 404));

@@ -29,8 +29,10 @@
     // Days after the worker marks a job done before the payment releases automatically.
     "AUTO_RELEASE_DAYS": "5",
     // Comma-separated emails that can see and resolve disputes.
-    "ADMIN_EMAILS": ""
+    "ADMIN_EMAILS": "",
+    // Sender address; its domain must be verified with the email provider before emails go out.
+    "EMAIL_FROM": "Get It Done <no-reply@example.com>"
   }
-  // Secrets (never in this file): STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET.
+  // Secrets (never in this file): STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, RESEND_API_KEY.
   // Set with `npx wrangler secret put <NAME>`; locally use .dev.vars (see .dev.vars.example).
 }

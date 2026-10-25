@@ -48,6 +48,7 @@ function toast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.hidden = false;
+  toast.at = Date.now();
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => (t.hidden = true), 3200);
 }
@@ -368,7 +369,7 @@ async function profileView() {
   state.me = u;
   const form = h('form', { onsubmit: action(async () => {
     const v = formData(form);
-    await api('/me', { method: 'PUT', body: { ...v, isBusiness: v.isBusiness === 'on', insured: v.insured === 'on' } });
+    await api('/me', { method: 'PUT', body: { ...v, isBusiness: v.isBusiness === 'on', insured: v.insured === 'on', notifyMessages: v.notifyMessages === 'on' } });
     toast('Profile saved');
     await loadMe();
   }) },
@@ -384,8 +385,23 @@ async function profileView() {
     field('ABN', h('input', { id: 'abn', name: 'abn', inputmode: 'numeric', value: u.abn, placeholder: '11 digits' })),
     field('Licence number', h('input', { id: 'lic', name: 'licenceNo', value: u.licenceNo }), 'Needed for licensed trades like electrical and plumbing. Shown on your profile.'),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'insured', checked: u.insured }), 'I hold public liability insurance'),
+    h('h2', {}, 'Emails'),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'notifyMessages', checked: u.notifyMessages }), 'Email me when I get a new message'),
+    h('p', { class: 'muted' }, 'Emails about your jobs and payments (quotes, bookings, payouts) always send.'),
     h('button', { class: 'block' }, 'Save profile'),
   );
+  const pw = h('form', { class: 'card', onsubmit: action(async () => {
+    const v = formData(pw);
+    if (v.password !== v.confirm) throw new Error('The new passwords don’t match');
+    await api('/auth/password', { body: { current: v.current, password: v.password } });
+    pw.reset();
+    toast('Password changed. Other devices have been logged out.');
+  }) },
+    h('h2', { style: 'margin-top:0' }, 'Change password'),
+    field('Current password', h('input', { id: 'cpw', name: 'current', type: 'password', required: true, autocomplete: 'current-password' })),
+    field('New password', h('input', { id: 'cnpw', name: 'password', type: 'password', required: true, minlength: 10, autocomplete: 'new-password' })),
+    field('Confirm new password', h('input', { id: 'cnpw2', name: 'confirm', type: 'password', required: true, minlength: 10, autocomplete: 'new-password' })),
+    h('button', { class: 'block' }, 'Change password'));
   const payouts = h('div', { class: 'card' },
     h('h2', { style: 'margin-top:0' }, 'Getting paid'),
     u.payoutsReady
@@ -400,7 +416,7 @@ async function profileView() {
     h('h1', {}, 'Profile'),
     h('p', { class: 'muted' }, u.email, ' · ', h('a', { href: `#/u/${u.id}` }, 'View public profile'),
       u.rating?.count ? ` · ${stars(u.rating.avg)} (${u.rating.count})` : ''),
-    payouts, form,
+    payouts, form, pw,
     u.isAdmin ? h('a', { class: 'btn secondary block', href: '#/admin' }, 'Admin: disputes') : null,
     h('button', { class: 'secondary block', onclick: action(async () => { await api('/auth/logout', { body: {} }); state.me = null; go('#/'); }) }, 'Log out'),
     h('p', { class: 'muted', style: 'margin-top:16px' }, h('a', { href: '/terms.html' }, 'Terms'), ' · ', h('a', { href: '/privacy.html' }, 'Privacy')),
@@ -445,6 +461,7 @@ function authView(mode) {
     signup ? h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'acceptTerms', required: true }),
       h('span', {}, 'I agree to the ', h('a', { href: '/terms.html', target: '_blank' }, 'terms'), ' and ', h('a', { href: '/privacy.html', target: '_blank' }, 'privacy policy'))) : null,
     h('button', { class: 'block' }, signup ? 'Create account' : 'Log in'),
+    signup ? null : h('p', { style: 'margin-top:12px' }, h('a', { href: '#/forgot' }, 'Forgot password?')),
   );
   show(
     h('h1', {}, signup ? 'Create your account' : 'Log in'),
@@ -452,6 +469,41 @@ function authView(mode) {
     form,
     h('p', { style: 'margin-top:16px' }, signup ? 'Already have an account? ' : 'New here? ', h('a', { href: signup ? '#/login' : '#/signup' }, signup ? 'Log in' : 'Create an account')),
   );
+}
+
+function forgotView() {
+  const form = h('form', { onsubmit: action(async () => {
+    await api('/auth/forgot', { body: formData(form) });
+    show(h('h1', {}, 'Check your email'),
+      h('p', {}, 'If there’s an account with that email, we’ve sent a link to reset your password. It expires in 1 hour.'),
+      h('p', { class: 'muted' }, 'Nothing arrived? Check your spam folder, or try again in a few minutes.'),
+      h('a', { class: 'btn secondary block', href: '#/login' }, 'Back to log in'));
+  }) },
+    field('Email', h('input', { id: 'femail', name: 'email', type: 'email', required: true, autocomplete: 'email' })),
+    h('button', { class: 'block' }, 'Send reset link'));
+  show(h('h1', {}, 'Reset your password'), h('p', { class: 'muted' }, 'Enter your account email and we’ll send you a link.'), form,
+    h('p', { style: 'margin-top:16px' }, h('a', { href: '#/login' }, 'Back to log in')));
+}
+
+function resetView() {
+  const token = new URLSearchParams(location.hash.split('?')[1] || '').get('token') || '';
+  // Keep the token out of the address bar and browser history once we've read it.
+  history.replaceState(null, '', '#/reset');
+  resetView.token = token || resetView.token;
+  const form = h('form', { onsubmit: action(async () => {
+    const v = formData(form);
+    if (v.password !== v.confirm) throw new Error('The passwords don’t match');
+    await api('/auth/reset', { body: { token: resetView.token, password: v.password } });
+    resetView.token = '';
+    await loadMe();
+    toast('Password changed. You’re logged in.');
+    go('#/');
+  }) },
+    field('New password', h('input', { id: 'npw', name: 'password', type: 'password', required: true, minlength: 10, autocomplete: 'new-password' }), 'At least 10 characters.'),
+    field('Confirm new password', h('input', { id: 'npw2', name: 'confirm', type: 'password', required: true, minlength: 10, autocomplete: 'new-password' })),
+    h('button', { class: 'block' }, 'Set new password'));
+  show(h('h1', {}, 'Choose a new password'),
+    resetView.token ? form : h('p', {}, 'This link is incomplete. ', h('a', { href: '#/forgot' }, 'Ask for a new one.')));
 }
 
 async function adminView() {
@@ -480,11 +532,14 @@ async function loadMe() {
 
 async function render() {
   clearInterval(state.poll);
+  // A message about the previous page shouldn't linger on the next one.
+  // (Toasts raised just before navigating, like "Job posted", are kept.)
+  if (Date.now() - (toast.at || 0) > 800) document.getElementById('toast').hidden = true;
   const [path] = location.hash.slice(1).split('?');
   const parts = (path || '/').split('/').filter(Boolean);
   const tab = { '': 'browse', post: 'post', mine: 'mine', profile: 'profile' }[parts[0] ?? ''];
   document.querySelectorAll('.tabs a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab));
-  if (!['login', 'signup'].includes(parts[0])) sessionStorage.setItem('after', location.hash || '#/');
+  if (!['login', 'signup', 'forgot', 'reset'].includes(parts[0])) sessionStorage.setItem('after', location.hash || '#/');
   try {
     if (!parts.length) await browseView();
     else if (parts[0] === 'post') await postView();
@@ -493,6 +548,8 @@ async function render() {
     else if (parts[0] === 'profile') await profileView();
     else if (parts[0] === 'u' && parts[1]) await userView(parts[1]);
     else if (parts[0] === 'login' || parts[0] === 'signup') authView(parts[0]);
+    else if (parts[0] === 'forgot') forgotView();
+    else if (parts[0] === 'reset') resetView();
     else if (parts[0] === 'admin') await adminView();
     else show(h('p', { class: 'empty' }, 'Page not found.'));
   } catch (err) {

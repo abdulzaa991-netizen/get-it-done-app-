@@ -36,12 +36,14 @@ I didn't find anything better for this stage. One option to consider later is Du
 - [x] Simulated payments mode (no Stripe key = no money moves) for building and testing
 - [x] **Live payments locked:** a live Stripe key is refused unless `ALLOW_LIVE_PAYMENTS=true` is set, which needs owner approval
 - [x] Rate limits on signup, login, posting and messages; CSRF protection; CSP and security headers
-- [x] Unit tests (state machine, money, crypto, webhook signatures) + a 56-check end-to-end test
+- [x] Password reset by email (single-use link, expires in 1 hour, logs out all devices) and change password in the profile
+- [x] Email notifications: welcome, new quote, quote accepted, payment held, marked done, paid, dispute raised/resolved, new message (at most one per conversation every 15 min, can be turned off)
+- [x] Unit tests (state machine, money, crypto, webhook signatures) + a 76-check end-to-end test
 
 ## Can wait (after MVP)
 
-1. Email notifications (new quote, accepted, paid, done), via Resend or Cloudflare Email
-2. Password reset (needs email, so it goes with 1). **Must ship before public launch.**
+1. ~~Email notifications~~ and ~~password reset~~: **built**. They need an email provider account before emails really go out (see Setup)
+2. Email verification on signup (confirm the address is real before someone can post or quote)
 3. Photo uploads on jobs and on completion (Cloudflare R2)
 4. Verification: ABN lookup (ABR web services, free), licence checks per state register, insurance certificate upload
 5. Push notifications, and an app-store wrapper (Capacitor) if the PWA isn't enough
@@ -63,7 +65,7 @@ Estimates as at October 2026. **Check each on the provider's pricing page before
 | Domain name (.com.au or .com) | About A$15–30/year | Before launch, after the brand decision |
 | Stripe card fees | About 1.7% + A$0.30 per domestic card payment (more for international cards) | Per transaction, when live |
 | Stripe Connect (Express) | About A$2–3 per active worker per month + about 0.25% + A$0.25 per payout | When live |
-| Email (Resend etc.) | Free tier around 3,000 emails/month | When notifications ship |
+| Email (Resend) | Free tier around 3,000 emails/month (100/day); paid about US$20/month after that | Before launch. Code is ready; needs an account in the company's name |
 | Lawyer: terms, privacy, contractor model review | Rough guess A$2,000–8,000 one-off | Before launch |
 | Platform insurance (public liability, professional indemnity, cyber) | Rough guess A$1,500–5,000/year; get broker quotes | Before launch |
 | Company registration (Pty Ltd, decided) | ASIC fee about A$600, plus accountant setup if used | Before launch |
@@ -75,8 +77,8 @@ Estimates as at October 2026. **Check each on the provider's pricing page before
 
 1. ~~Brand/ownership decision~~ **Decided: its own business, separate Pty Ltd.** Name check, company registration and accounts in the company's name are still to do (see [LEGAL.md §7](LEGAL.md#7-business-structure))
 2. Legal items in [LEGAL.md](LEGAL.md) done and terms/privacy pages replaced
-3. Password reset + email notifications shipped
-4. Security review (run `/security-review`, plus manual review of payments and authorisation)
+3. ~~Password reset + email notifications~~ built. Email provider account set up, and sending domain verified
+4. Security review (run `/security-review`, plus manual review of payments and authorisation). Include: emails carry user-written text (names, job titles, message snippets), so check they can't be used to send convincing phishing from our domain
 5. Stripe account in **test mode** first: run the full flow with test cards
 6. **Owner approves live payments** → set the live key as a secret, set `ALLOW_LIVE_PAYMENTS=true`
 7. Soft launch in one area with known tradies before opening up
@@ -89,7 +91,10 @@ npx wrangler d1 create get-it-done          # paste the id into wrangler.jsonc
 npm run db:migrate:remote
 npx wrangler secret put STRIPE_SECRET_KEY    # test key (sk_test_...) first
 npx wrangler secret put STRIPE_WEBHOOK_SECRET
+npx wrangler secret put RESEND_API_KEY       # after verifying the sending domain in Resend
 npm run deploy
 ```
+
+Set `EMAIL_FROM` in `wrangler.jsonc` to an address on the verified domain (e.g. `Get It Done <hello@yourdomain.com.au>`), and set `APP_URL` to the real site address, because email links use it.
 
 Stripe webhook endpoint: `https://<your-domain>/api/stripe/webhook`, events `checkout.session.completed` and `account.updated`. Enable Connect (Express) in the Stripe dashboard.

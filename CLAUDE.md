@@ -20,14 +20,17 @@ A two-sided local jobs marketplace (trade overflow + home jobs). Cloudflare Work
 - Money is integer cents (AUD). Times are unix ms.
 - Front end: `public/`, no build step. Build DOM with `h()` (textContent only); never `innerHTML` with user data.
 - Public user data goes through `publicUser()`; email, address and payout details are never public.
+- Emails: add them to `src/notify.ts` and send with `defer(c, ...)`. They must never throw or block the action. No `RESEND_API_KEY` = nothing is sent.
+- Never log email bodies (they contain reset links).
 
 ## Commands
 
 ```bash
 npm install
 npm run db:migrate:local
-npx wrangler dev --var ADMIN_EMAILS:admin@test.local   # simulated payments, http://localhost:8787
+npm run dev         # simulated payments + captured emails, http://localhost:8787
 npm test            # unit tests
 npm run typecheck
 npm run e2e         # full lifecycle against the running dev server
+npm run db:clear-limits:local   # if repeated local runs hit rate limits
 ```

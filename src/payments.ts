@@ -3,6 +3,7 @@
 // can never both move the same money; Stripe idempotency keys back that up.
 
 import { Env, isSimulated } from './env';
+import { notify } from './notify';
 import { stripeFor } from './stripe';
 
 interface PaymentRow {
@@ -114,7 +115,10 @@ export async function autoRelease(env: Env): Promise<number> {
   let n = 0;
   for (const j of results) {
     try {
-      if (await releasePayment(env, j.id, ['done'])) n++;
+      if (await releasePayment(env, j.id, ['done'])) {
+        n++;
+        await notify.released(env, j.id);
+      }
     } catch (e) {
       console.error('auto-release failed', j.id, e);
     }

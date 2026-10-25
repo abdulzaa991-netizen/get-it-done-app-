@@ -1,5 +1,5 @@
 // End-to-end run of the whole job lifecycle against a local `wrangler dev` (simulated payments).
-// Usage: npm run db:migrate:local && npx wrangler dev --var ADMIN_EMAILS:admin@test.local  (then)  npm run e2e
+// Usage: npm run db:migrate:local && npx wrangler dev --var ADMIN_EMAILS:admin@test.local --var DEV_OUTBOX:true  (then)  npm run e2e
 const BASE = process.env.BASE_URL || 'http://localhost:8787';
 const run = Date.now();
 let failures = 0;
@@ -23,6 +23,25 @@ function check(name, cond, detail) {
   if (!cond) failures++;
 }
 
+const emailOf = (who) => `${who}-${run}@test.local`;
+/** Emails captured by the dev outbox (sent after the response, so poll briefly). */
+async function emailsTo(addr, minCount = 1) {
+  for (let i = 0; i < 20; i++) {
+    const { emails } = await (await fetch(`${BASE}/api/dev/outbox?to=${encodeURIComponent(addr)}`)).json();
+    if (emails.length >= minCount) return emails;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  const { emails } = await (await fetch(`${BASE}/api/dev/outbox?to=${encodeURIComponent(addr)}`)).json();
+  return emails;
+}
+async function hasEmail(addr, subjectPart) {
+  for (let i = 0; i < 20; i++) {
+    if ((await emailsTo(addr, 0)).some((e) => e.subject.includes(subjectPart))) return true;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return false;
+}
+
 const poster = client(), worker = client(), other = client(), admin = client(), anon = client();
 const signup = (c, who) => c('/auth/signup', { email: `${who}-${run}@test.local`, password: 'longenough123', name: who, suburb: 'Parramatta', postcode: '2150', acceptTerms: true });
 
@@ -31,6 +50,7 @@ check('worker signs up', (await signup(worker, 'Wes')).status === 201);
 check('other signs up', (await signup(other, 'Ola')).status === 201);
 await admin('/auth/signup', { email: 'admin@test.local', password: 'longenough123', name: 'Admin', acceptTerms: true });
 check('admin logs in', (await admin('/auth/login', { email: 'admin@test.local', password: 'longenough123' })).status === 200);
+check('welcome email sent', await hasEmail(emailOf('Pat'), 'Welcome'));
 check('signup needs terms', (await anon('/auth/signup', { email: `x${run}@t.local`, password: 'longenough123', name: 'X' })).status === 400);
 check('wrong password rejected', (await anon('/auth/login', { email: `pat-${run}@test.local`, password: 'nope' })).status === 401);
 check('form-encoded POST rejected (CSRF)', (await fetch(BASE + '/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'a=1' })).status === 400);
@@ -53,6 +73,7 @@ check('poster cannot quote own job', (await poster(`/jobs/${id}/quotes`, { amoun
 check('worker sets up payouts (simulated)', (await worker('/payouts/onboard', {})).data.simulated === true);
 check('worker quotes', (await worker(`/jobs/${id}/quotes`, { amount: '110', message: 'Can do Saturday, text 0412 345 678' })).status === 201);
 check('other quotes', (await other(`/jobs/${id}/quotes`, { amount: '95' })).status === 201);
+check('poster emailed about each quote', (await emailsTo(emailOf('Pat'), 3)).filter((e) => e.subject.startsWith('New quote')).length === 2);
 check('worker cannot see other quotes', (await worker(`/jobs/${id}`)).data.quotes.length === 1);
 
 const pjob = (await poster(`/jobs/${id}`)).data;
@@ -63,6 +84,11 @@ const wesId = pjob.quotes.find((q) => q.amountCents === 11000).worker.id;
 check('worker messages poster', (await worker(`/jobs/${id}/messages`, { body: 'Is the side gate unlocked? me@mail.com' })).status === 201);
 check('poster replies', (await poster(`/jobs/${id}/messages`, { body: 'Yes it is', worker: wesId })).status === 201);
 const msgs = (await poster(`/jobs/${id}/messages?worker=${wesId}`)).data.messages;
+check('poster emailed about message', await hasEmail(emailOf('Pat'), 'New message from Wes'));
+check('worker emailed about reply', await hasEmail(emailOf('Wes'), 'New message from Pat'));
+await worker(`/jobs/${id}/messages`, { body: 'second message' });
+await new Promise((r) => setTimeout(r, 400));
+check('message emails throttled', (await emailsTo(emailOf('Pat'))).filter((e) => e.subject.startsWith('New message')).length === 1);
 check('chat thread has 2 messages, email masked', msgs.length === 2 && msgs[0].body.includes('[email hidden]'), msgs);
 check('other cannot read worker thread', (await other(`/jobs/${id}/messages?worker=${wesId}`)).data.messages.length === 0);
 check('poster cannot open thread with stranger', (await poster(`/jobs/${id}/messages`, { body: 'hi', worker: 'nobody' })).status === 404);
@@ -70,6 +96,7 @@ check('poster cannot open thread with stranger', (await poster(`/jobs/${id}/mess
 const quoteId = pjob.quotes.find((q) => q.amountCents === 11000).id;
 check('worker cannot accept', (await worker(`/jobs/${id}/accept`, { quoteId })).status === 403);
 check('poster accepts quote', (await poster(`/jobs/${id}/accept`, { quoteId })).status === 200);
+check('worker emailed: got the job', await hasEmail(emailOf('Wes'), 'You got the job'));
 check('double accept blocked', (await poster(`/jobs/${id}/accept`, { quoteId })).status >= 400);
 check('job hidden from public once taken', (await anon(`/jobs/${id}`)).status === 404);
 check('worker cannot mark done before payment', (await worker(`/jobs/${id}/done`, {})).status === 409);
@@ -78,12 +105,16 @@ check('worker does not see address before payment', (await worker(`/jobs/${id}`)
 check('poster pays (simulated hold)', (await poster(`/jobs/${id}/pay`, {})).data.simulated === true);
 let w = (await worker(`/jobs/${id}`)).data;
 check('job funded, worker now sees address', w.job.status === 'funded' && w.job.address === '1 Secret St', w.job);
+check('worker emailed: payment held', await hasEmail(emailOf('Wes'), 'Payment held'));
+check('poster emailed: booked', await hasEmail(emailOf('Pat'), 'Booked'));
 check('worker sees fee and payout', w.job.feeCents === 1100);
 check('poster cannot release before done', (await poster(`/jobs/${id}/confirm`, {})).status === 409);
 check('poster cannot cancel once funded', (await poster(`/jobs/${id}/cancel`, {})).status === 409);
 check('worker marks done', (await worker(`/jobs/${id}/done`, {})).status === 200);
+check('poster emailed: please confirm', await hasEmail(emailOf('Pat'), 'Please confirm'));
 check('review blocked before release', (await poster(`/jobs/${id}/reviews`, { rating: 5 })).status === 409);
 check('poster confirms & releases', (await poster(`/jobs/${id}/confirm`, {})).status === 200);
+check('worker emailed: paid with net amount', (await emailsTo(emailOf('Wes'))).some((e) => e.subject.startsWith('You’ve been paid') && e.body.includes('$99')));
 check('double release blocked', (await poster(`/jobs/${id}/confirm`, {})).status === 409);
 check('poster reviews worker', (await poster(`/jobs/${id}/reviews`, { rating: 5, body: 'Great job' })).status === 201);
 check('worker reviews poster', (await worker(`/jobs/${id}/reviews`, { rating: 4 })).status === 201);
@@ -100,11 +131,13 @@ check('fixed quote at fixed price', q2.amountCents === 240000);
 await poster(`/jobs/${job2}/accept`, { quoteId: q2.id });
 await poster(`/jobs/${job2}/pay`, {});
 check('worker raises problem', (await worker(`/jobs/${job2}/dispute`, { reason: 'Poster has not given access to the unit.' })).status === 200);
+check('poster + admin emailed about dispute', (await hasEmail(emailOf('Pat'), 'A problem was reported')) && (await hasEmail('admin@test.local', 'New dispute')));
 check('non-admin cannot list disputes', (await poster('/admin/disputes')).status === 403);
 const disputes = (await admin('/admin/disputes')).data.disputes;
 const d = disputes.find((x) => x.jobId === job2);
 check('admin sees dispute', !!d, disputes);
 check('admin refunds', (await admin(`/admin/disputes/${d.id}/resolve`, { outcome: 'refund', note: 'Agreed by both' })).status === 200);
+check('both emailed resolution', (await hasEmail(emailOf('Pat'), 'Problem resolved')) && (await hasEmail(emailOf('Wes'), 'Problem resolved')));
 check('job refunded', (await poster(`/jobs/${job2}`)).data.job.status === 'refunded');
 
 // Cancel path
@@ -114,6 +147,35 @@ check('cannot quote cancelled job', (await worker(`/jobs/${job3}/quotes`, { amou
 
 const mine = (await worker('/jobs/mine')).data;
 check('worker "working" list has both jobs', mine.working.length === 2);
+
+// Password reset and change
+const rita = client(), ritaOtherDevice = client(), resetter = client();
+check('rita signs up', (await signup(rita, 'Rita')).status === 201);
+check('rita logs in on another device', (await ritaOtherDevice('/auth/login', { email: emailOf('Rita'), password: 'longenough123' })).status === 200);
+check('forgot: unknown email looks the same', (await anon('/auth/forgot', { email: `nobody-${run}@test.local` })).status === 200);
+await new Promise((r) => setTimeout(r, 300));
+check('forgot: no email for unknown address', (await emailsTo(`nobody-${run}@test.local`, 0)).length === 0);
+check('forgot: known email ok', (await anon('/auth/forgot', { email: emailOf('Rita').toUpperCase() })).status === 200);
+const resetMail = (await emailsTo(emailOf('Rita'), 2)).find((e) => e.subject.includes('Reset'));
+const token = resetMail?.body.match(/#\/reset\?token=([a-f0-9]{64})/)?.[1];
+check('reset email contains link', !!token, resetMail);
+check('reset rejects bad token', (await resetter('/auth/reset', { token: 'f'.repeat(64), password: 'brandnewpass1' })).status === 400);
+check('reset rejects short password', (await resetter('/auth/reset', { token, password: 'short' })).status === 400);
+check('reset with token works', (await resetter('/auth/reset', { token, password: 'brandnewpass1' })).status === 200);
+check('reset logs you in', (await resetter('/me')).data.user?.name === 'Rita');
+check('token is single use', (await anon('/auth/reset', { token, password: 'anotherpass12' })).status === 400);
+check('old sessions logged out', (await ritaOtherDevice('/me')).data.user === null);
+check('old password no longer works', (await anon('/auth/login', { email: emailOf('Rita'), password: 'longenough123' })).status === 401);
+check('new password works', (await anon('/auth/login', { email: emailOf('Rita'), password: 'brandnewpass1' })).status === 200);
+check('password-changed email sent', await hasEmail(emailOf('Rita'), 'password was changed'));
+await anon('/auth/forgot', { email: emailOf('Rita') });
+const first = (await emailsTo(emailOf('Rita'), 4)).find((e) => e.subject.includes('Reset'))?.body.match(/token=([a-f0-9]{64})/)?.[1];
+await anon('/auth/forgot', { email: emailOf('Rita') });
+check('new reset link cancels the previous one', (await anon('/auth/reset', { token: first, password: 'anotherpass12' })).status === 400);
+check('change password: wrong current rejected', (await resetter('/auth/password', { current: 'nope', password: 'thirdpassword1' })).status === 400);
+check('change password works', (await resetter('/auth/password', { current: 'brandnewpass1', password: 'thirdpassword1' })).status === 200);
+check('still logged in after change', (await resetter('/me')).data.user?.name === 'Rita');
+check('message emails can be turned off', (await resetter('/me', { name: 'Rita', notifyMessages: false }, 'PUT')).status === 200 && (await resetter('/me')).data.user.notifyMessages === false);
 
 console.log(failures ? `\n${failures} FAILED` : '\nAll checks passed');
 process.exit(failures ? 1 : 0);
